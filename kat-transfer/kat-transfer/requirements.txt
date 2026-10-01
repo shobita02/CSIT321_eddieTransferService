@@ -1,0 +1,14 @@
+# Runtime -------------------------------------------------------------------
+# 0MQ notifications. Optional in the strict sense: set zmq.enabled = false in
+# config.toml and the service runs on its periodic sweep alone.
+pyzmq>=25.0
+
+# PostgreSQL driver, needed only when remote.kind = "postgres". The mock remote
+# is plain SQLite from the standard library, so you can leave this uninstalled
+# while developing against it.
+psycopg2-binary>=2.9
+
+# Development ---------------------------------------------------------------
+pytest>=7.0
+
+# Python 3.11+ is required: config loading uses the standard-library `tomllib`.
