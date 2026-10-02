@@ -18,7 +18,7 @@ Switching to the real server is a config change, not a code change.
 ## Quick start
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
 python3 tools/make_fake_db.py --reset     # build a fake KAT database
 python3 -m katxfer.service --status       # what is pending?
@@ -26,8 +26,61 @@ python3 -m katxfer.service --once         # transfer it
 python3 tools/verify_transfer.py          # prove it arrived intact
 ```
 
+Use `python3 -m pip install`, not plain `pip install`. On a machine with more
+than one Python — which most Windows machines have — bare `pip` often belongs to
+a different installation than the one running your scripts, and you get a
+package that is installed but not importable. Running pip *through* the same
+interpreter you launch the service with avoids that entirely.
+
+On Windows use `python` wherever this README says `python3`, and keep it
+consistent: `python -m pip install -r requirements.txt`, then
+`python -m katxfer.service --once`.
+
 That seeds 12,000 experimental rows plus 800 environment samples and ships them
 in about a third of a second.
+
+### If something goes wrong
+
+Run this first — it prints which Python you are on, which dependencies *that*
+interpreter can see, and the config paths it resolved:
+
+```bash
+python3 -m katxfer.service --doctor
+```
+
+**`ModuleNotFoundError: No module named 'zmq'`, but `pip install pyzmq` says
+"Requirement already satisfied"** — the classic two-Pythons problem. pip
+installed into one interpreter, your script is running under another. `--doctor`
+prints the path of the interpreter actually running, and the exact command to
+install into it:
+
+```bash
+python3 -m pip install pyzmq      # installs into the Python you just ran
+```
+
+A virtual environment prevents this permanently, and is worth doing if several
+people are working on this:
+
+```bash
+python3 -m venv .venv
+.venv\Scripts\activate            # Windows
+source .venv/bin/activate         # macOS / Linux
+python -m pip install -r requirements.txt
+```
+
+**`ModuleNotFoundError: No module named 'psycopg2'`** — only needed when
+`remote.kind = "postgres"`. `python3 -m pip install psycopg2-binary`.
+
+**`No config at ...`** — run the commands from the `kat-transfer` folder that
+contains `config.toml`, or pass `-c path/to/config.toml`. Relative paths inside
+the config resolve against the config file's own folder, not your shell's
+working directory.
+
+**`No KAT database at ...`** — run `python3 tools/make_fake_db.py --reset` first.
+
+**`unable to open database file`** — usually a `local.path` pointing somewhere
+that does not exist. `python3 -m katxfer.service --status` prints the paths it
+resolved, which is the quickest way to see what it actually read.
 
 ### The live version, with notifications
 

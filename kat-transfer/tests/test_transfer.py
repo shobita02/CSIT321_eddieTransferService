@@ -12,6 +12,9 @@ worth defending in the report:
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 from conftest import local_pending, remote_count
 
@@ -170,6 +173,43 @@ def test_transfer_log_records_each_batch(cfg):
     assert all(ok == 1 for *_, ok in rows)
     assert all(trigger == "manual" for *_, trigger, _ in rows)
     assert sum(sent for _, sent, _, _ in rows) == 25
+
+
+# -- optional dependencies ---------------------------------------------------
+
+
+def test_service_starts_without_pyzmq():
+    """pyzmq must stay optional, as the README and requirements.txt promise.
+
+    Regression test: `service.py` used to import `zmqbus` at module scope,
+    which imports pyzmq, so the service could not start at all without it --
+    not even `--status`, and not even with 0MQ disabled in the config. Run in
+    a subprocess because other tests in this suite import zmqbus directly.
+    """
+    probe = (
+        "import katxfer.service, sys;"
+        "leaked = sorted(m for m in sys.modules if m.split('.')[0] == 'zmq');"
+        "sys.exit('pyzmq imported at module scope: %s' % leaked if leaked else 0)"
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent.parent,
+        check=True,
+    )
+
+
+def test_doctor_reports_interpreter_and_dependencies(capsys, cfg, tmp_path):
+    """`--doctor` has to work even when things are broken, so it must not
+    depend on the config loading successfully."""
+    from katxfer.service import main
+
+    assert main(["--doctor", "-c", str(tmp_path / "missing.toml")]) == 0
+    out = capsys.readouterr().out
+
+    assert sys.executable in out  # the whole point: which Python is this?
+    assert "pyzmq" in out
+    assert "psycopg2" in out
+    assert "FAILED" in out  # it reported the bad config instead of crashing
 
 
 # -- local database access ---------------------------------------------------

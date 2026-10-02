@@ -23,10 +23,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import ServiceConfig, load as load_config
+from typing import TYPE_CHECKING
+
+from .config import DEFAULT_CONFIG_PATH, ServiceConfig, load as load_config
 from .localdb import LocalKatDb
 from .sinks import RemoteSink, build_sink
-from .zmqbus import Subscriber
+
+if TYPE_CHECKING:  # import for type checkers only, never at runtime
+    from .zmqbus import Subscriber
+
+# NOTE: katxfer.zmqbus is deliberately NOT imported here. It imports pyzmq,
+# which is an optional dependency -- the service is designed to run on its
+# periodic sweep alone, and importing at module scope would make a package
+# that is only needed for the notification shortcut mandatory just to run
+# `--status`. It is imported inside `run()`, and only when 0MQ is enabled.
 
 log = logging.getLogger("katxfer.service")
 
@@ -212,12 +222,30 @@ class TransferService:
         sub = None
         if self.cfg.zmq.enabled:
             try:
+                from .zmqbus import Subscriber
+
                 sub = Subscriber(
                     self.cfg.zmq.endpoint, self.cfg.zmq.topics, self.cfg.zmq.bind
                 )
+            except ImportError:
+                # pyzmq is not installed. Degrading to the sweep is safe -- it
+                # is the mechanism that guarantees delivery anyway -- so say so
+                # clearly and carry on rather than refusing to start.
+                log.warning(
+                    "pyzmq is not available to this Python (%s), so 0MQ "
+                    "notifications are off and transfers will happen on the "
+                    "%.0fs sweep instead. Install it into THIS interpreter "
+                    'with:  "%s" -m pip install pyzmq   '
+                    "(plain `pip` may belong to a different Python). Or set "
+                    "enabled = false under [zmq] in your config to silence "
+                    "this.",
+                    sys.executable,
+                    self.cfg.sweep_interval_s,
+                    sys.executable,
+                )
             except Exception as exc:  # noqa: BLE001
-                # A missing publisher must not stop the service; 0MQ is an
-                # optimisation over the sweep, not a dependency.
+                # A missing publisher must not stop the service either; 0MQ is
+                # an optimisation over the sweep, not a dependency.
                 log.warning("0MQ unavailable (%s); falling back to sweep only", exc)
 
         next_sweep = time.monotonic() + self.cfg.sweep_interval_s
@@ -284,6 +312,74 @@ class TransferService:
         return "\n".join(lines)
 
 
+def doctor(config_path: Path | None) -> str:
+    """Report what this Python can actually see.
+
+    Exists because the failure that wastes the most time is not a bug in the
+    service but a machine with more than one Python on it: `pip install X`
+    reports "Requirement already satisfied" while `import X` still fails,
+    because pip and the interpreter are not the same installation. Printing
+    the interpreter path next to each import result makes that obvious.
+    """
+    lines = [
+        "python     : " + sys.version.split()[0],
+        "executable : " + sys.executable,
+        "",
+        "dependencies (as seen by THIS interpreter):",
+    ]
+
+    def probe(module: str, package: str, needed_for: str) -> str:
+        try:
+            mod = __import__(module)
+        except ImportError:
+            return f"  [MISSING] {package:<16} needed for {needed_for}"
+        # Modules disagree about where they keep their version: sqlite3 uses
+        # `sqlite_version` for the engine, psycopg2 appends build flags to
+        # `__version__`. Take the first thing that looks like a version.
+        raw = next(
+            (
+                str(getattr(mod, attr))
+                for attr in ("__version__", "sqlite_version", "version")
+                if isinstance(getattr(mod, attr, None), str)
+            ),
+            "installed",
+        )
+        return f"  [ok]      {package:<16} {raw.split()[0]}"
+
+    lines.append(probe("zmq", "pyzmq", "0MQ notifications (optional)"))
+    lines.append(probe("psycopg2", "psycopg2-binary", "remote.kind = postgres"))
+    lines.append(probe("sqlite3", "sqlite3", "everything (standard library)"))
+
+    if any("[MISSING]" in line for line in lines):
+        lines += [
+            "",
+            "To install into this exact interpreter (plain `pip` may belong to",
+            "a different Python):",
+            f'    "{sys.executable}" -m pip install -r requirements.txt',
+        ]
+
+    lines.append("")
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"config     : FAILED ({type(exc).__name__}: {exc})")
+        return "\n".join(lines)
+
+    lines += [
+        f"config     : {config_path or DEFAULT_CONFIG_PATH}",
+        f"  local KAT db   : {cfg.local.path}"
+        + ("" if cfg.local.path.exists() else "   <-- DOES NOT EXIST"),
+        f"  remote         : {cfg.remote.kind}",
+        f"  0MQ enabled    : {cfg.zmq.enabled}",
+        f"  sweep interval : {cfg.sweep_interval_s:.0f}s",
+    ]
+    if not cfg.local.path.exists():
+        lines.append("")
+        lines.append("Create the fake database with:")
+        lines.append(f'    "{sys.executable}" tools/make_fake_db.py --reset')
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="kat-transfer",
@@ -291,6 +387,12 @@ def main(argv: list[str] | None = None) -> int:
         "remote archive.",
     )
     ap.add_argument("-c", "--config", type=Path, default=None)
+    ap.add_argument(
+        "--doctor",
+        action="store_true",
+        help="report this Python, its visible dependencies and the resolved "
+        "config, then exit; run this first when something will not start",
+    )
     ap.add_argument(
         "--once",
         action="store_true",
@@ -303,6 +405,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+
+    # Before load_config, which is itself one of the things that can fail.
+    if args.doctor:
+        print(doctor(args.config))
+        return 0
 
     cfg = load_config(args.config)
     logging.basicConfig(

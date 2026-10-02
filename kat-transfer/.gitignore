@@ -1,0 +1,16 @@
+# Generated databases - the fake KAT database and the mock remote.
+# Regenerate with: python3 tools/make_fake_db.py --reset
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+
+# Real credentials belong in the environment, never in the repo. config.toml
+# is tracked because it holds ${VAR} placeholders rather than secrets; if you
+# ever put a real password in it, un-track it immediately.
+.env
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

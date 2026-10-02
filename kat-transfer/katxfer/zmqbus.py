@@ -36,7 +36,29 @@ import time
 from dataclasses import dataclass
 from typing import Iterator
 
-import zmq
+try:
+    import zmq
+except ImportError as exc:  # pragma: no cover - depends on the environment
+    # Importing this module at all means something wants notifications, so a
+    # raw ModuleNotFoundError here is unhelpful.
+    #
+    # The common cause is not a missing package but several Pythons on one
+    # machine: `pip` installs into one, the script runs under another, and the
+    # user is told "Requirement already satisfied" while the import still
+    # fails. Naming the running interpreter turns that into a one-line fix.
+    import sys as _sys
+
+    raise ImportError(
+        "pyzmq is needed for 0MQ notifications, but is not installed for the "
+        "Python currently running:\n"
+        f"    {_sys.executable}\n\n"
+        "If `pip install pyzmq` already said \"Requirement already satisfied\", "
+        "then pip belongs to a DIFFERENT Python than this one. Install it into "
+        "this interpreter with:\n"
+        f'    "{_sys.executable}" -m pip install pyzmq\n\n'
+        "The transfer service itself does not need pyzmq: set enabled = false "
+        "under [zmq] in config.toml and it runs on its periodic sweep instead."
+    ) from exc
 
 log = logging.getLogger(__name__)
 
