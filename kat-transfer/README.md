@@ -11,14 +11,16 @@ and environment data up to the archive on the Bored Owl development server.
             (we read this)
 ```
 
-Right now the right-hand side is stubbed by a local SQLite file, so the whole
-pipeline runs on one laptop with no VPN, no credentials and no KAT install.
-Switching to the real server is a config change, not a code change.
+Right now the right-hand side is a PostgreSQL 16 container on your own machine
+(`docker-compose.yml`), built from the same schema as the real server, so the
+whole pipeline runs on one laptop with no VPN and no credentials. Switching to
+the real server is a config change, not a code change.
 
 ## Quick start
 
 ```bash
 python3 -m pip install -r requirements.txt
+docker compose up -d                      # the remote archive (PostgreSQL 16)
 
 python3 tools/make_fake_db.py --reset     # build a fake KAT database
 python3 -m katxfer.service --status       # what is pending?
@@ -78,9 +80,41 @@ working directory.
 
 **`No KAT database at ...`** — run `python3 tools/make_fake_db.py --reset` first.
 
+**`connection to server at "127.0.0.1", port 5432 failed`** — the Postgres
+container is not running. Start Docker Desktop, then `docker compose up -d`
+from the `kat-transfer` folder.
+
 **`unable to open database file`** — usually a `local.path` pointing somewhere
 that does not exist. `python3 -m katxfer.service --status` prints the paths it
 resolved, which is the quickest way to see what it actually read.
+
+### Running against the real KAT database
+
+`config.toml` points at `~/katdata.db`, the file KAT 1.0.3 creates in your home
+folder, and sends to the local Postgres container (`docker compose up -d`). 0MQ is switched off (`[zmq] enabled = false`) because KAT 1.0.3 has no
+publisher yet (see [docs/zeromq.md](docs/zeromq.md)), so transfers are
+triggered by hand:
+
+```bash
+python tools/show_state.py             # both databases, with the xfer column
+python -m katxfer.service --once       # transfer everything pending, then exit
+python tools/show_state.py             # xfer is now stamped; rows are remote
+python tools/verify_transfer.py        # row-by-row check: no loss, no corruption
+```
+
+The service writes to `katdata.db` only to set `xfer` on rows once the remote
+has them, which is what that column is for. To make every row look
+untransferred again while testing:
+`UPDATE ExperimentalData SET xfer = NULL; UPDATE Environment SET xfer = NULL;`
+— the remote upserts, so re-sending never duplicates.
+
+To empty the remote archive for a clean demo:
+`docker compose down -v` then `docker compose up -d` (the schema reloads
+automatically). To look at it directly:
+`docker exec -it kat-remote-pg psql -U kat -d csit321`.
+
+To go back to the generated fake database, set `local.path =
+"data/kat.sqlite"`.
 
 ### The live version, with notifications
 
@@ -142,12 +176,12 @@ string is read from the environment, which is how credentials stay out of git.
 
 | Key | Meaning |
 |---|---|
-| `local.path` | KAT's SQLite file. Point at the real one once KAT is installed. |
+| `local.path` | KAT's SQLite file. `~/katdata.db` for real KAT, `data/kat.sqlite` for the generated one. |
 | `local.batch_size` | Rows per transaction. 500 is comfortable. |
 | `local.busy_timeout_s` | How long to wait for SQLite's write lock while KAT is inserting. |
-| `remote.kind` | `sqlite` for the local stand-in, `postgres` for the dev server. |
+| `remote.kind` | `postgres` (local container or dev server); `sqlite` for a no-Docker fallback. |
 | `remote.path` | Mock remote file, when `kind = "sqlite"`. |
-| `remote.host/port/database/user/password` | Dev server details, when `kind = "postgres"`. |
+| `remote.host/port/database/user/password` | `127.0.0.1` / `kat` / `kat` for the container; the dev server's via `${KAT_PG_USER}` etc. |
 | `zmq.enabled` | `false` runs on the sweep alone. |
 | `zmq.endpoint` | Where KAT publishes. |
 | `zmq.topics` | Prefix filters. `[""]` subscribes to everything. |
@@ -169,7 +203,9 @@ then in `config.toml`:
 
 ```toml
 [remote]
-kind = "postgres"          # was "sqlite"
+host = "192.168.40.100"            # was "127.0.0.1"
+user = "${KAT_PG_USER}"            # was "kat"
+password = "${KAT_PG_PASSWORD}"    # was "kat"
 
 [service]
 origin = "real"            # was "fake", once this is real KAT data
@@ -186,15 +222,17 @@ killed mid-run and restarted.
 katxfer/
   config.py      configuration loading
   localdb.py     reading KAT's SQLite, stamping xfer
-  sinks.py       the two remotes: PostgresSink and SqliteMockSink
+  sinks.py       the two remotes: PostgresSink and SqliteMockSink (fallback)
   service.py     the drain loop, triggers, retries, CLI
   zmqbus.py      Publisher / Subscriber
   fakedata.py    fake data generation, shared by the seeder and the simulator
 tools/
   make_fake_db.py    build a fake KAT database
   kat_simulator.py   stand in for KAT: write rows live and publish notifications
+  show_state.py      print both databases and the xfer column, before/after
   zmq_listen.py      watch the notification stream
   verify_transfer.py compare local against remote, row by row
+docker-compose.yml   local PostgreSQL 16 standing in for the dev server
 schema/
   kat_sqlite.sql       KAT's schema, verbatim
   remote_postgres.sql  the archive schema, with design notes
@@ -227,8 +265,11 @@ subscriber connects really are lost, and that the data transfers anyway.
 3. **Two indexes on `xfer`** (`schema/kat_sqlite.sql`). Without them every sweep
    is a full table scan. They change no semantics, but they are an addition to
    KAT's schema and he should approve them.
-4. **The `data` column format** is a guess — CSV-ish for experimental data,
-   `key=value;` for environment. The service treats it as opaque text, so this
-   only matters for the generated fake data.
-5. **0MQ specifics** — endpoint, topic names, and whether KAT publishes per row
-   or per transaction. See the end of `docs/zeromq.md`.
+4. **The `data` column format.** Real KAT writes a JSON object built from a
+   J4 Record (`{"temperature":22.5,"pressure":101.3}`). The service treats it
+   as opaque text, so this only matters for the generated fake data, which is
+   still CSV-ish.
+5. **0MQ is not in KAT 1.0.3.** Which release will contain it, and its
+   endpoint, topic names, and whether it publishes per row or per
+   transaction. Until then transfers are triggered manually. See
+   `docs/zeromq.md`.

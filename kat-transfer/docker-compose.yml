@@ -1,0 +1,35 @@
+# Local PostgreSQL standing in for the archive on the Bored Owl dev server.
+#
+#   docker compose up -d          start it (first start loads the schema)
+#   docker compose down -v        stop it AND wipe the data, for a clean demo
+#
+# The schema in schema/remote_postgres.sql is loaded automatically the first
+# time the volume is created, so this database has exactly the tables, keys
+# and constraints the real server will have.
+#
+# The credentials below are for this throwaway local container only, which is
+# why they are fine to commit. It listens on 127.0.0.1, so nothing outside this
+# machine can reach it. The real server's credentials stay in the environment
+# (see config.example.toml).
+
+services:
+  remote-db:
+    image: postgres:16
+    container_name: kat-remote-pg
+    environment:
+      POSTGRES_DB: csit321
+      POSTGRES_USER: kat
+      POSTGRES_PASSWORD: kat
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - kat-remote-pg-data:/var/lib/postgresql/data
+      - ./schema/remote_postgres.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kat -d csit321"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  kat-remote-pg-data:

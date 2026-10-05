@@ -27,10 +27,17 @@ def fmt_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime(TS_FORMAT)[:-3]
 
 
-def parse_ts(text: str) -> datetime:
-    """Tolerant reader for whatever KAT actually wrote."""
+def parse_ts(text: str | int | float) -> datetime:
+    """Tolerant reader for whatever KAT actually wrote.
+
+    KAT 1.0.3 writes through sqlite-jdbc's `setTimestamp`, which stores
+    milliseconds since the Unix epoch as an INTEGER (e.g. 1790898246165), not
+    text. Our generated data uses ISO text. Accept both.
+    """
     if text is None:
         return None
+    if isinstance(text, (int, float)) or text.strip().isdigit():
+        return datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
     text = text.strip().replace("T", " ")
     if text.endswith("Z"):
         text = text[:-1]

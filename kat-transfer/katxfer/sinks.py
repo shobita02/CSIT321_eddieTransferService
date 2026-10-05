@@ -82,8 +82,9 @@ class RemoteSink(ABC):
         self.close()
 
 
-def _ts(value: str | None) -> datetime | None:
-    return parse_ts(value) if value else None
+def _ts(value: str | int | None) -> datetime | None:
+    # KAT stores epoch milliseconds; generated data stores ISO text.
+    return parse_ts(value) if value is not None and value != "" else None
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +391,7 @@ class SqliteMockSink(RemoteSink):
                 r.systemid,
                 r.run,
                 r.row_no,
-                r.ts,
+                _iso(_ts(r.ts)),
                 r.source,
                 r.data,
                 stamp,
@@ -423,7 +424,7 @@ class SqliteMockSink(RemoteSink):
             seen[r.digest] = (
                 r.digest,
                 r.systemid,
-                r.ts,
+                _iso(_ts(r.ts)),
                 r.data,
                 stamp,
                 self.origin,

@@ -238,3 +238,40 @@ def test_environment_digest_is_content_addressed(kat_db):
     )
     assert same_content_other_rowid.digest == first.digest
     assert len({r.digest for r in rows}) == len(rows)
+
+
+def test_kat_epoch_millisecond_timestamps(cfg):
+    """KAT 1.0.3 stores TIMESTAMP columns as epoch milliseconds, not text.
+
+    Taken from a real katdata.db produced by `ed-insert` / `env-record`.
+    """
+    from katxfer.fakedata import parse_ts
+
+    assert parse_ts(1790898246165).isoformat() == "2026-10-01T23:44:06.165000+00:00"
+    assert parse_ts("1790898246165") == parse_ts(1790898246165)
+
+    conn = sqlite3.connect(cfg.local.path)
+    conn.execute(
+        "INSERT INTO Experiment (systemid, run, description) VALUES (?,?,?)",
+        ("CSIT321FAKE", 9001, "Fake test experiment generated in KAT"),
+    )
+    conn.execute(
+        'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
+        "data, xfer) VALUES (?,?,?,?,?,?,NULL)",
+        ("CSIT321FAKE", 9001, 0, 1790898246165, "simulated",
+         '{"temperature":22.5,"pressure":101.3}'),
+    )
+    conn.execute(
+        "INSERT INTO Environment (systemid, timestamp, data, xfer) VALUES (?,?,?,NULL)",
+        ("CSIT321FAKE", 1790898290276, '{"room_temperature":21.8,"humidity":45.0}'),
+    )
+    conn.commit()
+    conn.close()
+
+    assert TransferService(cfg).run_once() == 27
+    conn = sqlite3.connect(cfg.remote.path)
+    ts = conn.execute(
+        "SELECT ts FROM experimental_data WHERE systemid = 'CSIT321FAKE'"
+    ).fetchone()[0]
+    conn.close()
+    assert ts == "2026-10-01 23:44:06.165"  # normalised, as Postgres would store it
