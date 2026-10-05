@@ -30,7 +30,7 @@ class ExperimentalRow:
     systemid: str
     run: int
     row_no: int
-    ts: str | None
+    ts: str | int | None  # KAT writes epoch ms; see fakedata.parse_ts
     source: str | None
     data: str | None
 
@@ -42,7 +42,7 @@ class ExperimentalRow:
 @dataclass(frozen=True)
 class EnvironmentRow:
     systemid: str
-    ts: str | None
+    ts: str | int | None  # KAT writes epoch ms; see fakedata.parse_ts
     data: str | None
     rowid: int
 

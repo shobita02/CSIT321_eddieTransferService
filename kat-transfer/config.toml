@@ -5,32 +5,42 @@
 # credentials stay out of git.
 
 [local]
-# The KAT SQLite database on this machine. When the real KAT is installed,
-# point this at the file it creates instead of the generated one.
-path = "data/kat.sqlite"
+# The KAT SQLite database on this machine. KAT 1.0.3 always creates it as
+# katdata.db in the user's home folder (C:\Users\<you>\katdata.db), so "~"
+# works on everyone's machine. Use "data/kat.sqlite" instead to run against
+# the generated fake database (tools/make_fake_db.py).
+path = "~/katdata.db"
 batch_size = 500
 busy_timeout_s = 10.0
 
 [remote]
-# "sqlite" runs against a local stand-in for the Bored Owl server, which is
-# what you want until VPN access and credentials exist.
-# Change to "postgres" and fill in the block below to go live.
-kind = "sqlite"
+# PostgreSQL in a local Docker container, standing in for the Bored Owl dev
+# server until VPN access and credentials exist. Start it with
+# `docker compose up -d` (see docker-compose.yml). These credentials belong to
+# that throwaway container only.
+#
+# To go live, change host to "192.168.40.100" and user/password to
+# "${KAT_PG_USER}" / "${KAT_PG_PASSWORD}" (read from the environment).
+#
+# kind = "sqlite" with path = "data/remote_mock.sqlite" still works if you
+# need to run without Docker.
+kind = "postgres"
 path = "data/remote_mock.sqlite"
-
-# --- used when kind = "postgres" ---
-host = "192.168.40.100"
+host = "127.0.0.1"
 port = 5432
 database = "csit321"
-user = "${KAT_PG_USER}"
-password = "${KAT_PG_PASSWORD}"
+user = "kat"
+password = "kat"
 sslmode = "prefer"
 connect_timeout_s = 10
 
 [zmq]
 # KAT publishes; we subscribe. Set enabled = false to run on the sweep alone,
 # which is a useful way to prove the service does not depend on 0MQ.
-enabled = true
+# KAT 1.0.3 has no 0MQ publisher (see docs/zeromq.md), so this is off and
+# transfers are triggered manually with `python -m katxfer.service --once`.
+# Turn it back on once KAT publishes.
+enabled = false
 endpoint = "tcp://127.0.0.1:5556"
 # Prefix filters. [""] means everything. Narrow it once KAT's topic names are
 # confirmed, e.g. ["kat.experimentaldata", "kat.environment"].
