@@ -1,0 +1,60 @@
+# kat-transfer configuration - LIVE server (192.168.40.100)
+#
+# Same as config.toml except [remote]. Paths are relative to this file.
+# Anything of the form ${VAR} is read from the environment, which is how
+# credentials stay out of git.
+
+[local]
+# The KAT SQLite database on this machine. KAT 1.0.3 always creates it as
+# katdata.db in the user's home folder (C:\Users\<you>\katdata.db), so "~"
+# works on everyone's machine. Use "data/kat.sqlite" instead to run against
+# the generated fake database (tools/make_fake_db.py).
+path = "~/katdata.db"
+batch_size = 500
+busy_timeout_s = 10.0
+
+[remote]
+# The live Bored Owl dev server. Nothing secret lives in this file: the
+# database name, role and password are read from the environment, so set
+# KAT_PG_DATABASE, KAT_PG_USER and KAT_PG_PASSWORD in the terminal first.
+# If one is unset it stays as the literal text "${...}" and the login fails
+# with what looks like a bad password.
+#
+# Run with:  python -m katxfer.service -c config.live.toml --doctor
+# The Docker demo still uses config.toml, untouched.
+kind = "postgres"
+host = "192.168.40.100"
+port = 5432
+database = "${KAT_PG_DATABASE}"
+user = "${KAT_PG_USER}"
+password = "${KAT_PG_PASSWORD}"
+sslmode = "prefer"
+connect_timeout_s = 10
+
+[zmq]
+# KAT publishes; we subscribe. Set enabled = false to run on the sweep alone,
+# which is a useful way to prove the service does not depend on 0MQ.
+# KAT 1.0.3 has no 0MQ publisher (see docs/zeromq.md), so this is off and
+# transfers are triggered manually with `python -m katxfer.service --once`.
+# Turn it back on once KAT publishes.
+enabled = false
+endpoint = "tcp://127.0.0.1:5556"
+# Prefix filters. [""] means everything. Narrow it once KAT's topic names are
+# confirmed, e.g. ["kat.experimentaldata", "kat.environment"].
+topics = [""]
+bind = false
+
+[service]
+# Safety net. Even with notifications working, the service re-checks for
+# untransferred rows this often. Lower it for a demo, raise it in production.
+sweep_interval_s = 10.0
+# After a notification wakes it, the service keeps absorbing notifications for
+# this long before transferring, so a burst of per-row notifications becomes one
+# batch instead of one transaction per row. Set to 0 to transfer immediately.
+notify_debounce_s = 0.5
+# Stamps every row this service ships. Use "fake" while testing against
+# generated data so the archive can tell real runs from synthetic ones.
+origin = "fake"
+retry_base_s = 2.0
+retry_max_s = 60.0
+log_level = "INFO"
