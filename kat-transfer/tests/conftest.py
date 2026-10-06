@@ -6,6 +6,7 @@ directory, so tests never touch data/ and can run in any order.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -47,14 +48,14 @@ def seed(db: Path, runs: int = 2, rows: int = 10, env: int = 5) -> None:
                     row,
                     fmt_ts(t0 + timedelta(seconds=row)),
                     "ADC-CH0",
-                    f"{run}.{row},1.0,2.0",
+                    json.dumps({"run": run, "row": row, "v": 1.0}),
                 ),
             )
     for i in range(env):
         conn.execute(
             "INSERT INTO Environment (systemid, timestamp, data, xfer) "
             "VALUES (?,?,?,NULL)",
-            ("K4-RIG-01", fmt_ts(t0 + timedelta(minutes=i)), f"ambient_c={20 + i}"),
+            ("K4-RIG-01", fmt_ts(t0 + timedelta(minutes=i)), json.dumps({"ambient_c": 20 + i})),
         )
     conn.commit()
     conn.close()

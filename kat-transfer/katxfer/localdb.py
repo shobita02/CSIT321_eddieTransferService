@@ -14,7 +14,6 @@ Two rules govern everything in this module:
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -47,16 +46,10 @@ class EnvironmentRow:
     rowid: int
 
     @property
-    def digest(self) -> str:
-        """Stable identity for a table that has no unique constraint.
-
-        Derived from the content KAT wrote, never from our rowid, so the same
-        sample digests identically no matter which machine ships it.
-        """
-        payload = "\x1f".join(
-            ["" if v is None else str(v) for v in (self.systemid, self.ts, self.data)]
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    def key(self) -> tuple[str, str | int | None]:
+        """Remote identity: the timestamp, plus systemid because the archive
+        collects from several rigs. Never the data, never our rowid."""
+        return (self.systemid, self.ts)
 
 
 @dataclass(frozen=True)
@@ -113,8 +106,8 @@ class LocalKatDb:
             ]
 
     def pending_environment(self, limit: int) -> list[EnvironmentRow]:
-        # Environment has no key of its own, so we carry SQLite's implicit
-        # rowid through to the stamping step. It never leaves this machine.
+        # We carry SQLite's implicit rowid through to the stamping step as a
+        # cheap handle on the row. It never leaves this machine.
         sql = """
             SELECT rowid AS rid, systemid, timestamp, data
             FROM Environment

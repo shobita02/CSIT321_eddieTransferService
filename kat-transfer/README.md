@@ -243,7 +243,7 @@ tests/
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q      # 17 tests
+python3 -m pytest tests/ -q      # 23 tests
 ```
 
 They cover the completeness, idempotence and ordering properties above, plus the
@@ -252,23 +252,24 @@ subscriber connects really are lost, and that the data transfers anyway.
 
 ## Open questions for Jonathan
 
-1. **`Environment` has no unique constraint.** There is no natural key to upsert
-   against, so the client derives `digest = sha256(systemid|timestamp|data)` and
-   uses that. Two byte-identical samples for the same system at the same instant
-   collapse into one remote row. That is almost certainly desirable, but it is a
-   behaviour change — the alternative is adding `UNIQUE (systemid, timestamp)`
-   on the KAT side.
+1. **`Environment` key (resolved).** The remote `environment` table is keyed
+   on the timestamp, together with `systemid` because the archive collects
+   from several rigs. Samples with identical data at different instants are
+   kept as separate rows. KAT's own table is unchanged and has no unique
+   constraint; if it ever holds two rows for the same system and instant, the
+   later one wins remotely.
 2. **Writing `xfer` back to KAT's database.** The service writes to KAT's file,
    which assumes KAT tolerates another process holding the write lock briefly.
    Is WAL mode on? If KAT would rather we did not touch its file at all, the
    alternative is a sidecar database tracking what we have sent.
-3. **Two indexes on `xfer`** (`schema/kat_sqlite.sql`). Without them every sweep
-   is a full table scan. They change no semantics, but they are an addition to
-   KAT's schema and he should approve them.
+3. **Partial indexes on `xfer`.** Jonathan is adding these on the KAT side,
+   since they change KAT's database; we do not create them. Until then every
+   sweep scans the whole table, which is correct, just slower.
 4. **The `data` column format.** Real KAT writes a JSON object built from a
-   J4 Record (`{"temperature":22.5,"pressure":101.3}`). The service treats it
-   as opaque text, so this only matters for the generated fake data, which is
-   still CSV-ish.
+   J4 Record (`{"temperature":22.5,"pressure":101.3}`). Remotely `data` is a
+   PostgreSQL `json` column (not `jsonb`, so the text is stored exactly as KAT
+   wrote it). A non-JSON payload is rejected by the remote and its row stays
+   unstamped. The generated fake data emits JSON too.
 5. **0MQ is not in KAT 1.0.3.** Which release will contain it, and its
    endpoint, topic names, and whether it publishes per row or per
    transaction. Until then transfers are triggered manually. See

@@ -4,14 +4,16 @@ Shared by the one-shot seeder (tools/make_fake_db.py) and the live simulator
 (tools/kat_simulator.py) so that a database you seed and a database you grow
 look the same.
 
-The shape of `data` is a guess: KAT stores it as free TEXT, and nobody has
-told us the real encoding yet. It is deliberately isolated in this one module
-so that when Jonathan's k4 generator lands, swapping the payload format means
-editing `experimental_payload` and nothing else.
+`data` is a JSON object, as real KAT writes it (built from a J4 Record), and
+the remote archive stores it in a `json` column, which rejects anything else.
+The key names are still guesses; they are isolated in this one module so that
+when Jonathan's k4 generator lands, matching them means editing
+`experimental_payload` / `environment_payload` and nothing else.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -86,26 +88,29 @@ class Rig:
     def experimental_payload(self, row: int) -> str:
         """The TEXT that goes in ExperimentalData.data.
 
-        CSV of the channel values in CHANNELS order. Replace this when the
-        real k4 payload format is known.
+        A JSON object of channel -> value, in CHANNELS order. Adjust the keys
+        when the real k4 payload format is known.
         """
         vals = self.reading(row)
-        return ",".join(f"{vals[c]}" for c in CHANNELS)
+        return json.dumps({c: vals[c] for c in CHANNELS})
 
     def environment_payload(self, tick: int) -> str:
         """The TEXT that goes in Environment.data.
 
-        Ambient conditions as key=value pairs, which is a common KAT-ish
-        convention and survives round-tripping through CSV export.
+        Ambient conditions as a JSON object.
         """
         r = self._rng
         t = tick / 20.0
         amb = 19.0 + 3.5 * math.sin(t / 11) + r.gauss(0, 0.15)
         rh = 48 + 9 * math.sin(t / 17 + 1.1) + r.gauss(0, 0.6)
         baro = 1013.2 + 4 * math.sin(t / 29) + r.gauss(0, 0.3)
-        return (
-            f"ambient_c={amb:.2f};relative_humidity={rh:.1f};"
-            f"barometric_hpa={baro:.1f};mains_hz={50 + r.gauss(0, 0.02):.3f}"
+        return json.dumps(
+            {
+                "ambient_c": round(amb, 2),
+                "relative_humidity": round(rh, 1),
+                "barometric_hpa": round(baro, 1),
+                "mains_hz": round(50 + r.gauss(0, 0.02), 3),
+            }
         )
 
 

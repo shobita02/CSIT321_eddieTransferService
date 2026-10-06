@@ -11,12 +11,15 @@ worth defending in the report:
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-from conftest import local_pending, remote_count
+import pytest
+
+from conftest import KAT_SCHEMA, local_pending, remote_count
 
 from katxfer.localdb import LocalKatDb
 from katxfer.service import TransferService
@@ -55,7 +58,7 @@ def test_only_new_rows_move(cfg):
     conn.execute(
         'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
         'data, xfer) VALUES (?,?,?,?,?,?,NULL)',
-        ("K4-RIG-01", 1, 999, "2026-10-01 10:00:00.000", "ADC-CH0", "new"),
+        ("K4-RIG-01", 1, 999, "2026-10-01 10:00:00.000", "ADC-CH0", '{"new": true}'),
     )
     conn.commit()
     conn.close()
@@ -83,26 +86,93 @@ def test_resend_after_crash_does_not_duplicate(cfg):
     assert remote_count(cfg.remote.path, "environment") == 5
 
 
-def test_identical_environment_samples_collapse(cfg):
-    """Environment has no unique key, so identity is a digest of the content.
+def test_identical_environment_samples_do_not_collapse(cfg):
+    """Identity is (systemid, timestamp), never the content.
 
-    A quiet sensor emitting the same reading twice at the same instant is
-    indistinguishable from a duplicated row, and collapses. This test exists to
-    make that behaviour explicit rather than accidental -- see note 3 in
-    schema/remote_postgres.sql.
+    A quiet sensor reporting the same reading at two instants is two samples,
+    and both must reach the archive -- see note 3 in schema/remote_postgres.sql.
     """
     conn = sqlite3.connect(cfg.local.path)
     conn.execute(
         "INSERT INTO Environment (systemid, timestamp, data, xfer) "
-        "SELECT systemid, timestamp, data, NULL FROM Environment LIMIT 1"
+        "SELECT systemid, '2026-10-01 12:00:00.000', data, NULL "
+        "FROM Environment LIMIT 1"
     )
     conn.commit()
     conn.close()
 
     TransferService(cfg).run_once()
 
-    assert local_pending(cfg.local.path) == (0, 0)  # both stamped locally
-    assert remote_count(cfg.remote.path, "environment") == 5  # collapsed to one
+    assert local_pending(cfg.local.path) == (0, 0)
+    assert remote_count(cfg.remote.path, "environment") == 6  # both kept
+
+
+def test_repeated_environment_key_in_kat_does_not_wedge(cfg):
+    """KAT's Environment has no unique constraint, so it can hold two rows for
+    the same system and instant. The remote key holds one; the later wins,
+    both are stamped, and the service does not get stuck retrying the batch."""
+    conn = sqlite3.connect(cfg.local.path)
+    conn.execute(
+        "INSERT INTO Environment (systemid, timestamp, data, xfer) "
+        "SELECT systemid, timestamp, '{\"later\": true}', NULL "
+        "FROM Environment ORDER BY rowid LIMIT 1"
+    )
+    conn.commit()
+    conn.close()
+
+    TransferService(cfg).run_once()
+
+    assert local_pending(cfg.local.path) == (0, 0)
+    assert remote_count(cfg.remote.path, "environment") == 5
+    conn = sqlite3.connect(cfg.remote.path)
+    data = conn.execute("SELECT data FROM environment ORDER BY ts LIMIT 1").fetchone()[0]
+    conn.close()
+    assert data == '{"later": true}'
+
+
+def test_two_rigs_same_instant_both_kept(cfg, tmp_path):
+    """Two laptops can sample at the same instant. The archive key includes
+    systemid, so neither overwrites the other."""
+    TransferService(cfg).run_once()
+    first_ts = sqlite3.connect(cfg.local.path).execute(
+        "SELECT timestamp FROM Environment ORDER BY rowid LIMIT 1"
+    ).fetchone()[0]
+
+    other = tmp_path / "other_kat.sqlite"
+    conn = sqlite3.connect(other)
+    conn.executescript(KAT_SCHEMA)
+    conn.execute(
+        "INSERT INTO Environment (systemid, timestamp, data, xfer) "
+        "VALUES (?, ?, ?, NULL)",
+        ("K4-RIG-02", first_ts, '{"ambient_c": 99}'),
+    )
+    conn.commit()
+    conn.close()
+
+    other_cfg = dataclasses.replace(
+        cfg, local=dataclasses.replace(cfg.local, path=other)
+    )
+    assert TransferService(other_cfg).run_once() == 1
+    assert remote_count(cfg.remote.path, "environment") == 6
+
+
+def test_invalid_json_rejected_and_left_unstamped(cfg):
+    """The remote `data` column is json. A payload that is not JSON must fail
+    the write, and a failed write must never be stamped locally."""
+    TransferService(cfg).run_once()
+    conn = sqlite3.connect(cfg.local.path)
+    conn.execute(
+        "INSERT INTO Environment (systemid, timestamp, data, xfer) "
+        "VALUES ('K4-RIG-01', '2026-10-01 12:00:00.000', 'ambient_c=20', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        TransferService(cfg).run_once()
+
+    assert local_pending(cfg.local.path) == (0, 1)  # still waiting
+    assert remote_count(cfg.remote.path, "environment") == 5
 
 
 # -- 3. referential integrity ------------------------------------------------
@@ -225,19 +295,19 @@ def test_pending_query_ignores_transferred_rows(kat_db):
     assert db.pending_counts()["ExperimentalData"] == 15
 
 
-def test_environment_digest_is_content_addressed(kat_db):
-    """Digest must depend on KAT's content only, never on our local rowid."""
+def test_environment_key_is_system_and_timestamp(kat_db):
+    """Identity comes from KAT's natural key, never our rowid or the data."""
     db = LocalKatDb(kat_db)
     rows = db.pending_environment(limit=100)
     first = rows[0]
 
     from katxfer.localdb import EnvironmentRow
 
-    same_content_other_rowid = EnvironmentRow(
-        systemid=first.systemid, ts=first.ts, data=first.data, rowid=first.rowid + 1000
+    other_rowid_and_data = EnvironmentRow(
+        systemid=first.systemid, ts=first.ts, data="{}", rowid=first.rowid + 1000
     )
-    assert same_content_other_rowid.digest == first.digest
-    assert len({r.digest for r in rows}) == len(rows)
+    assert other_rowid_and_data.key == first.key == (first.systemid, first.ts)
+    assert len({r.key for r in rows}) == len(rows)
 
 
 def test_kat_epoch_millisecond_timestamps(cfg):
