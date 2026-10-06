@@ -5,8 +5,8 @@ Two implementations behind one interface:
 * `PostgresSink`  - the real target on the Bored Owl dev server.
 * `SqliteMockSink` - a local file that mimics it, so the whole pipeline can be
   developed and demonstrated before VPN access exists. It implements the same
-  constraints (primary keys, the digest key on environment) so that a bug
-  caught here is a bug that would have happened on the real server.
+  constraints (primary keys, JSON validity of `data`) so that a bug caught
+  here is a bug that would have happened on the real server.
 
 Every write is an upsert on a key the client can compute, which is what makes
 the "stamp xfer only after remote commit" ordering safe: a replayed batch
@@ -196,26 +196,23 @@ class PostgresSink(RemoteSink):
 
         sql = """
             INSERT INTO environment
-                (digest, systemid, ts, data, xfer, origin, src_host)
+                (systemid, ts, data, xfer, origin, src_host)
             VALUES %s
-            ON CONFLICT (digest) DO UPDATE SET
+            ON CONFLICT (systemid, ts) DO UPDATE SET
+                data     = EXCLUDED.data,
                 xfer     = EXCLUDED.xfer,
                 origin   = EXCLUDED.origin,
                 src_host = EXCLUDED.src_host
         """
-        # De-duplicate within the batch: ON CONFLICT cannot update the same
-        # row twice in one statement, and identical environment samples do
-        # occur when a sensor is quiet.
-        seen: dict[str, tuple] = {}
+        # KAT's Environment has no unique constraint, so a batch can repeat a
+        # (systemid, ts) key. ON CONFLICT cannot update the same row twice in
+        # one statement, so keep the last one -- the same result the mock gets
+        # from executemany, and the only one a keyed remote table can hold.
+        seen: dict[tuple, tuple] = {}
         for r in rows:
-            seen[r.digest] = (
-                r.digest,
-                r.systemid,
-                _ts(r.ts),
-                r.data,
-                xfer,
-                self.origin,
-                self.src_host,
+            ts = _ts(r.ts)
+            seen[(r.systemid, ts)] = (
+                r.systemid, ts, r.data, xfer, self.origin, self.src_host
             )
         values = list(seen.values())
         with self._conn.cursor() as cur:
@@ -285,7 +282,7 @@ CREATE TABLE IF NOT EXISTS experimental_data (
     row_no      INTEGER NOT NULL,
     ts          TEXT,
     source      TEXT,
-    data        TEXT,
+    data        TEXT CHECK (data IS NULL OR json_valid(data)),
     xfer        TEXT,
     origin      TEXT NOT NULL DEFAULT 'real',
     src_host    TEXT,
@@ -294,14 +291,14 @@ CREATE TABLE IF NOT EXISTS experimental_data (
     FOREIGN KEY (systemid, run) REFERENCES experiment (systemid, run)
 );
 CREATE TABLE IF NOT EXISTS environment (
-    digest      TEXT PRIMARY KEY,
     systemid    TEXT NOT NULL,
-    ts          TEXT,
-    data        TEXT,
+    ts          TEXT NOT NULL,
+    data        TEXT CHECK (data IS NULL OR json_valid(data)),
     xfer        TEXT,
     origin      TEXT NOT NULL DEFAULT 'real',
     src_host    TEXT,
-    ingested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+    ingested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+    PRIMARY KEY (systemid, ts)
 );
 CREATE TABLE IF NOT EXISTS transfer_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,28 +408,22 @@ class SqliteMockSink(RemoteSink):
             return WriteResult(0, 0)
         sql = """
             INSERT INTO environment
-                (digest, systemid, ts, data, xfer, origin, src_host)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (digest) DO UPDATE SET
+                (systemid, ts, data, xfer, origin, src_host)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (systemid, ts) DO UPDATE SET
+                data     = excluded.data,
                 xfer     = excluded.xfer,
                 origin   = excluded.origin,
                 src_host = excluded.src_host
         """
         stamp = _iso(xfer)
-        seen: dict[str, tuple] = {}
-        for r in rows:
-            seen[r.digest] = (
-                r.digest,
-                r.systemid,
-                _iso(_ts(r.ts)),
-                r.data,
-                stamp,
-                self.origin,
-                self.src_host,
-            )
-        cur = self._conn.executemany(sql, list(seen.values()))
+        values = [
+            (r.systemid, _iso(_ts(r.ts)), r.data, stamp, self.origin, self.src_host)
+            for r in rows
+        ]
+        cur = self._conn.executemany(sql, values)
         self._conn.commit()
-        return WriteResult(len(rows), cur.rowcount)
+        return WriteResult(len(values), cur.rowcount)
 
     def log_transfer(
         self,

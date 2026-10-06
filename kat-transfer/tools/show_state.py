@@ -102,7 +102,7 @@ def main() -> int:
     table(
         remote,
         "environment",
-        "SELECT substr(digest, 1, 12) AS digest, systemid, ts, data, xfer FROM environment",
+        "SELECT systemid, ts, data, xfer FROM environment ORDER BY systemid, ts",
         args.limit,
     )
     table(
@@ -111,7 +111,9 @@ def main() -> int:
         "SELECT 'experimental_data' AS tbl, COUNT(*) AS total_rows, "
         "(SELECT COUNT(*) FROM (SELECT DISTINCT systemid, run, row_no FROM experimental_data) AS k) AS distinct_keys "
         "FROM experimental_data "
-        "UNION ALL SELECT 'environment', COUNT(*), COUNT(DISTINCT digest) FROM environment",
+        "UNION ALL SELECT 'environment', COUNT(*), "
+        "(SELECT COUNT(*) FROM (SELECT DISTINCT systemid, ts FROM environment) AS k) "
+        "FROM environment",
         args.limit,
     )
     table(

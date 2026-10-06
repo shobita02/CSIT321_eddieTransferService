@@ -118,7 +118,7 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
     conn.execute(
         'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
         'data, xfer) VALUES (?,?,?,?,?,?,NULL)',
-        ("K4-RIG-01", 1, 500, "2026-10-01 11:00:00.000", "ADC-CH0", "unannounced"),
+        ("K4-RIG-01", 1, 500, "2026-10-01 11:00:00.000", "ADC-CH0", '{"unannounced": true}'),
     )
     conn.commit()
     conn.close()
