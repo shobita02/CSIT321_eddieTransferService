@@ -129,4 +129,4 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
 
     assert moved == 26
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "experimental_data") == 21
+    assert remote_count(cfg.remote, "experimental_data") == 21
