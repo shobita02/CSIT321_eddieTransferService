@@ -1,276 +1,213 @@
 # kat-transfer
 
-The **CSIT321 Transfer Client** from the Eddie System architecture diagram: it
-watches the KAT SQLite database on a local machine, and moves new experimental
-and environment data up to the archive on the Bored Owl development server.
+The **CSIT321 Transfer Client**. It reads new rows from the KAT SQLite database
+on a laptop and sends them to the PostgreSQL archive on the Bored Owl dev
+server (`192.168.40.100`).
 
 ```
-  Desktop KAT ──0MQ PUB/SUB──► kat-transfer ──► NGINX ──► CSIT321 Gateway ──► Experimental Data DB
-       │                            ▲                                          (PostgreSQL, 192.168.40.100)
-       └──► KAT SQLite DB ──────────┘
-            (we read this)
+KAT  ──► KAT SQLite DB (~/katdata.db) ──► kat-transfer ──► PostgreSQL archive
+                                                           (192.168.40.100)
 ```
 
-Right now the right-hand side is a PostgreSQL 16 container on your own machine
-(`docker-compose.yml`), built from the same schema as the real server, so the
-whole pipeline runs on one laptop with no VPN and no credentials. Switching to
-the real server is a config change, not a code change.
+## How the transfer works
 
-## Quick start
+KAT's tables already have an `xfer` column. A row with `xfer IS NULL` has not
+been sent yet. That column is the only state the service keeps.
 
-```bash
-python3 -m pip install -r requirements.txt
-docker compose up -d                      # the remote archive (PostgreSQL 16)
-
-python3 tools/make_fake_db.py --reset     # build a fake KAT database
-python3 -m katxfer.service --status       # what is pending?
-python3 -m katxfer.service --once         # transfer it
-python3 tools/verify_transfer.py          # prove it arrived intact
+```
+1. read a batch of rows WHERE xfer IS NULL          (ExperimentalData, Environment)
+2. send the parent Experiment rows for that batch   (so the foreign key is satisfied)
+3. upsert the batch into PostgreSQL and commit
+4. only then set xfer = now() on those rows in KAT's database
+5. repeat until nothing is pending
 ```
 
-Use `python3 -m pip install`, not plain `pip install`. On a machine with more
-than one Python — which most Windows machines have — bare `pip` often belongs to
-a different installation than the one running your scripts, and you get a
-package that is installed but not importable. Running pip *through* the same
-interpreter you launch the service with avoids that entirely.
+What this gives you:
 
-On Windows use `python` wherever this README says `python3`, and keep it
-consistent: `python -m pip install -r requirements.txt`, then
-`python -m katxfer.service --once`.
+- **Nothing is missed.** The service asks the database what is pending, so it
+  doesn't matter whether it was running when KAT wrote the data.
+- **Nothing is duplicated.** Every remote write is an upsert on a primary key
+  (see below), so sending a row twice just updates it.
+- **Nothing is lost on a crash.** `xfer` is stamped only *after* the remote
+  commits. A crash in between means the rows are sent again, never skipped.
+- **A failed write is retried.** If the server is down or rejects a batch, the
+  rows keep `xfer = NULL` and go in the next attempt.
 
-That seeds 12,000 experimental rows plus 800 environment samples and ships them
-in about a third of a second.
+The only thing the service writes to KAT's database is `xfer`. The KAT schema
+remains exactly the same as provided (`schema/kat_sqlite.sql`).
 
-### If something goes wrong
+## The remote tables and their primary keys
 
-Run this first — it prints which Python you are on, which dependencies *that*
-interpreter can see, and the config paths it resolved:
+Defined in `schema/remote_postgres.sql`.
 
-```bash
-python3 -m katxfer.service --doctor
-```
+| Remote table | Comes from (KAT) | Primary key | Notes |
+|---|---|---|---|
+| `experiment` | `Experiment` | `(systemid, run)` | Same as KAT's `UNIQUE (systemid, run)` |
+| `experimental_data` | `ExperimentalData` | `(systemid, run, row_no)` | KAT's `row` is renamed `row_no`. Foreign key to `experiment` |
+| `environment` | `Environment` | `(systemid, ts)` | **Added by us**, see below |
+| `transfer_log` | — | `id` | One row per batch sent: when, how many, success or failure |
 
-**`ModuleNotFoundError: No module named 'zmq'`, but `pip install pyzmq` says
-"Requirement already satisfied"** — the classic two-Pythons problem. pip
-installed into one interpreter, your script is running under another. `--doctor`
-prints the path of the interpreter actually running, and the exact command to
-install into it:
+- **`environment` key.** KAT's `Environment` table has no unique constraint, so
+  the archive keys it on the timestamp plus `systemid` (several rigs send to
+  one archive, and two rigs can sample at the same instant). Samples with the
+  same data at different times are always kept as separate rows. If KAT ever
+  writes two rows for the same rig at the same instant, the later one is kept.
+- **`data` is `json`** in `experimental_data` and `environment`. Plain `json`
+  (not `jsonb`) stores the text exactly as KAT wrote it. A payload that isn't
+  valid JSON is rejected by PostgreSQL and its row stays unsent.
+- **Extra columns** on every data table: `xfer` (when it was sent), `origin`
+  (`real` or `fake`), `src_host` (which laptop sent it) and `ingested_at`.
 
-```bash
-python3 -m pip install pyzmq      # installs into the Python you just ran
-```
+## Install
 
-A virtual environment prevents this permanently, and is worth doing if several
-people are working on this:
+Install the requirements into a virtual environment (venv). It keeps this
+project's packages separate from everything else on your machine and and server avoids
+the "installed but `No module named ...`" problem you get when a laptop has
+more than one Python.
 
-```bash
-python3 -m venv .venv
-.venv\Scripts\activate            # Windows
-source .venv/bin/activate         # macOS / Linux
+**First time only,** from the `kat-transfer` folder:
+
+```powershell
+python -m venv .venv                          # create the venv (macOS/Linux: python3)
+.venv\Scripts\Activate.ps1                    # activate it (macOS/Linux: source .venv/bin/activate)
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-**`ModuleNotFoundError: No module named 'psycopg2'`** — only needed when
-`remote.kind = "postgres"`. `python3 -m pip install psycopg2-binary`.
+**Every new terminal:** activate it again before running anything:
 
-**`No config at ...`** — run the commands from the `kat-transfer` folder that
-contains `config.toml`, or pass `-c path/to/config.toml`. Relative paths inside
-the config resolve against the config file's own folder, not your shell's
-working directory.
-
-**`No KAT database at ...`** — run `python3 tools/make_fake_db.py --reset` first.
-
-**`connection to server at "127.0.0.1", port 5432 failed`** — the Postgres
-container is not running. Start Docker Desktop, then `docker compose up -d`
-from the `kat-transfer` folder.
-
-**`unable to open database file`** — usually a `local.path` pointing somewhere
-that does not exist. `python3 -m katxfer.service --status` prints the paths it
-resolved, which is the quickest way to see what it actually read.
-
-### Running against the real KAT database
-
-`config.toml` points at `~/katdata.db`, the file KAT 1.0.3 creates in your home
-folder, and sends to the local Postgres container (`docker compose up -d`). 0MQ is switched off (`[zmq] enabled = false`) because KAT 1.0.3 has no
-publisher yet (see [docs/zeromq.md](docs/zeromq.md)), so transfers are
-triggered by hand:
-
-```bash
-python tools/show_state.py             # both databases, with the xfer column
-python -m katxfer.service --once       # transfer everything pending, then exit
-python tools/show_state.py             # xfer is now stamped; rows are remote
-python tools/verify_transfer.py        # row-by-row check: no loss, no corruption
+```powershell
+.venv\Scripts\Activate.ps1
 ```
 
-The service writes to `katdata.db` only to set `xfer` on rows once the remote
-has them, which is what that column is for. To make every row look
-untransferred again while testing:
-`UPDATE ExperimentalData SET xfer = NULL; UPDATE Environment SET xfer = NULL;`
-— the remote upserts, so re-sending never duplicates.
+You'll see `(.venv)` at the start of the prompt when it's active. Type
+`deactivate` to leave it.
 
-To empty the remote archive for a clean demo:
-`docker compose down -v` then `docker compose up -d` (the schema reloads
-automatically). To look at it directly:
-`docker exec -it kat-remote-pg psql -U kat -d csit321`.
+- **`running scripts is disabled on this system`** when activating in
+  PowerShell: run
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, then activate
+  again. In Command Prompt use `.venv\Scripts\activate.bat` instead.
+- **VS Code:** press Ctrl+Shift+P, choose *Python: Select Interpreter*, then
+  pick `.venv`. New terminals then activate it automatically.
+- `.venv` is in `.gitignore`, so it's never committed. Everyone creates their
+  own.
+- Always use `python -m pip`, not bare `pip`, so packages go into the Python
+  that runs the service.
 
-To go back to the generated fake database, set `local.path =
-"data/kat.sqlite"`.
 
-### The live version, with notifications
+## 
+## Run it locally (Docker, no VPN) (Database resets and cleans at the start of each container so easier to start from scratch)
 
-Three terminals:
+`config.toml` sends to a PostgreSQL container on your own machine, built from
+the same schema. Useful for testing and as a backup demo.
 
-```bash
-python3 tools/kat_simulator.py --rate 20 --duration 60   # 1: pretends to be KAT
-python3 -m katxfer.service -v                            # 2: the transfer service
-python3 tools/zmq_listen.py                              # 3: watch the 0MQ traffic
+```powershell
+docker compose up -d                          # start the local archive
+python tools/make_fake_db.py --reset          # optional: build a fake KAT database or you can generate fake data through KAT
+python -m katxfer.service --status
+python -m katxfer.service --once
+python tools/verify_transfer.py
+python tools/show_state.py                    # print both databases side by side
 ```
 
-Terminal 2 will show `trigger=zmq` as notifications arrive, and `trigger=sweep`
-when the safety-net timer fires instead.
+`config.toml` reads the real `~/katdata.db`. To use the fake source database instead,
+set `path = "data/kat.sqlite"` under `[local]`.
 
-## How it works
+- **Start the archive again from empty:** `docker compose down -v`, then
+  `docker compose up -d`. Do this after any change to `remote_postgres.sql`.
+- **Look at the archive directly:** `docker exec -it kat-remote-pg psql -U kat -d csit321`
+- **Make every KAT row unsent again:**
+  `UPDATE ExperimentalData SET xfer = NULL; UPDATE Environment SET xfer = NULL;`
+  It's safe, because the remote upserts. 
 
-The whole design rests on the `xfer` column that is already in your supervisor's
-schema. A row with `xfer IS NULL` has not been transferred; that is the entire
-state of the system, and it lives in the database rather than in the service's
-memory or in a message queue.
+## Run it against the live PostgreSQL server (config.live.toml file)
 
+You need the VPN connected.
+
+**1. [DONE] [You can drop and rebuild everything if you want to, just set katdata.db back to original to reset if you want real type of data] Create the tables (once).** In pgAdmin, connect to the server, open the
+Query Tool on the archive database, open `schema/remote_postgres.sql` and run
+it. Or with `psql`:
+
+```powershell
+psql -h 192.168.40.100 -U <your_role> -d <database> -f schema/remote_postgres.sql
 ```
-wait for a 0MQ notification, or for the sweep timer
-  └─► take a batch of rows WHERE xfer IS NULL
-      └─► upsert them into the remote
-          └─► only then, stamp xfer locally
+
+**2. Set your login for this terminal.** `config.live.toml` reads these from
+the environment, so no password is ever saved in a file:
+
+```powershell
+$env:KAT_PG_DATABASE = "<database>"
+$env:KAT_PG_USER     = "<your_role>"
+$env:KAT_PG_PASSWORD = "<password>"
 ```
 
-Four properties follow, and `tests/test_transfer.py` asserts each one:
+These last only for this PowerShell window. If one isn't set, the login fails
+with what looks like a wrong password.
 
-- **Nothing is missed.** The service asks the database what is pending, so it
-  does not matter how many notifications were lost, or whether the service was
-  even running when the data was written.
-- **Nothing is duplicated.** Every remote write is an upsert on a natural key
-  (`systemid, run, row` for experimental data). Re-sending is harmless.
-- **Nothing is lost on a crash.** `xfer` is stamped *after* the remote commits.
-  Crash in between and the rows get re-sent and upserted — a duplicate send
-  rather than a silent gap. The opposite ordering would lose data permanently.
-- **Parents arrive first.** `Experiment` has no `xfer` column, so there is no
-  watermark to follow. Each batch fetches the `Experiment` rows for the runs it
-  is about to ship and upserts those first, satisfying the remote foreign key.
+**3. Run the transfer:**
 
-### 0MQ is an optimisation, not the mechanism
+```powershell
+python -m katxfer.service -c config.live.toml --doctor        # check setup and resolved config
+python -m katxfer.service -c config.live.toml --status        # pending locally vs rows on the server
+python -m katxfer.service -c config.live.toml --once          # send everything pending, then exit
+python -m katxfer.service -c config.live.toml --status        # pending should now be 0
+python tools/verify_transfer.py -c config.live.toml           # row-by-row check: nothing missing or changed
+```
 
-ZeroMQ PUB/SUB drops messages — if no subscriber is connected yet, if a
-subscriber falls behind, or during the few milliseconds a connection takes to
-establish. This service therefore treats a notification as a hint that means
-"there may be new rows", and never as data. The periodic sweep is what makes it
-correct; the notifications are what make it fast.
+To keep it running and sending new rows as KAT writes them, leave out `--once`:
 
-Set `enabled = false` under `[zmq]` and everything still works, just with up to
-`sweep_interval_s` of latency. **[docs/zeromq.md](docs/zeromq.md)** explains the
-whole thing, including the questions still open for Jonathan.
+```powershell
+python -m katxfer.service -c config.live.toml
+```
+
+Before sending real KAT data, set `origin = "real"` under `[service]` in
+`config.live.toml`, so the archive doesn't label it `fake`.
+
+
+
+## If something goes wrong
+
+Run `python -m katxfer.service --doctor` first (add `-c config.live.toml` for
+the live server). It shows which Python is running, which packages it can see,
+and the config it loaded.
+
 
 ## Configuration
 
-Everything lives in `config.toml` (copy `config.example.toml`). `${VAR}` in any
-string is read from the environment, which is how credentials stay out of git.
-
-| Key | Meaning |
+| File | Sends to |
 |---|---|
-| `local.path` | KAT's SQLite file. `~/katdata.db` for real KAT, `data/kat.sqlite` for the generated one. |
-| `local.batch_size` | Rows per transaction. 500 is comfortable. |
-| `local.busy_timeout_s` | How long to wait for SQLite's write lock while KAT is inserting. |
-| `remote.kind` | `postgres` (local container or dev server); `sqlite` for a no-Docker fallback. |
-| `remote.path` | Mock remote file, when `kind = "sqlite"`. |
-| `remote.host/port/database/user/password` | `127.0.0.1` / `kat` / `kat` for the container; the dev server's via `${KAT_PG_USER}` etc. |
-| `zmq.enabled` | `false` runs on the sweep alone. |
-| `zmq.endpoint` | Where KAT publishes. |
-| `zmq.topics` | Prefix filters. `[""]` subscribes to everything. |
-| `service.sweep_interval_s` | Safety-net re-check. |
-| `service.notify_debounce_s` | Coalescing window after a notification, so a burst becomes one batch. |
-| `service.origin` | Tags every row `fake` or `real` in the archive. |
+| `config.toml` | Local Docker PostgreSQL (`127.0.0.1`, user `kat`) |
+| `config.live.toml` | Live server `192.168.40.100`, login from `$env:KAT_PG_*` |
 
-## Going live on the dev server
+Any `${VAR}` in a config value is read from the environment. Main settings:
+`[local] path` (KAT's database), `[local] batch_size` (rows per batch),
+`[service] sweep_interval_s` (how often it checks for new rows when left
+running), `[service] origin` (`real` or `fake`).
 
-Once the VPN and Postgres credentials exist:
 
-```bash
-psql -h 192.168.40.100 -U <you> -d csit321 -f schema/remote_postgres.sql
+## Still open
 
-export KAT_PG_USER=... KAT_PG_PASSWORD=...
+1. **0mq notification subscription to be added**
+2. **CSIT321 Gateway and API structure to be built**
+
+## Tests
+
+The tests send to a real PostgreSQL, so start the Docker container first:
+
+```powershell
+docker compose up -d
+python -m pytest tests/ -q      # 23 tests
 ```
 
-then in `config.toml`:
-
-```toml
-[remote]
-host = "192.168.40.100"            # was "127.0.0.1"
-user = "${KAT_PG_USER}"            # was "kat"
-password = "${KAT_PG_PASSWORD}"    # was "kat"
-
-[service]
-origin = "real"            # was "fake", once this is real KAT data
-```
-
-Nothing else changes. This path is not theoretical — it has been run end to end
-against a real PostgreSQL 16 instance: 12,800 rows transferred, re-sent in full
-without duplicating, and the service recovered on its own after the database was
-killed mid-run and restarted.
+Each run creates its own `kat_test` database in the container and empties it before every test, so the demo database (`csit321`) is never touched. If PostgreSQL isn't running, the tests that need it are skipped and tell you to start it.
 
 ## Layout
 
 ```
-katxfer/
-  config.py      configuration loading
-  localdb.py     reading KAT's SQLite, stamping xfer
-  sinks.py       the two remotes: PostgresSink and SqliteMockSink (fallback)
-  service.py     the drain loop, triggers, retries, CLI
-  zmqbus.py      Publisher / Subscriber
-  fakedata.py    fake data generation, shared by the seeder and the simulator
-tools/
-  make_fake_db.py    build a fake KAT database
-  kat_simulator.py   stand in for KAT: write rows live and publish notifications
-  show_state.py      print both databases and the xfer column, before/after
-  zmq_listen.py      watch the notification stream
-  verify_transfer.py compare local against remote, row by row
-docker-compose.yml   local PostgreSQL 16 standing in for the dev server
-schema/
-  kat_sqlite.sql       KAT's schema, verbatim
-  remote_postgres.sql  the archive schema, with design notes
-docs/zeromq.md
+katxfer/          the service: config, localdb (KAT side), sinks (remote side), service (loop + CLI), zmqbus
+tools/            make_fake_db, kat_simulator, show_state, verify_transfer, zmq_listen
+schema/           kat_sqlite.sql (KAT, as provided), remote_postgres.sql (archive)
+config.toml       local Docker archive
+config.live.toml  live server
 tests/
 ```
-
-## Tests
-
-```bash
-python3 -m pytest tests/ -q      # 23 tests
-```
-
-They cover the completeness, idempotence and ordering properties above, plus the
-0MQ behaviour — including a test that asserts notifications sent before the
-subscriber connects really are lost, and that the data transfers anyway.
-
-## Open questions for Jonathan
-
-1. **`Environment` key (resolved).** The remote `environment` table is keyed
-   on the timestamp, together with `systemid` because the archive collects
-   from several rigs. Samples with identical data at different instants are
-   kept as separate rows. KAT's own table is unchanged and has no unique
-   constraint; if it ever holds two rows for the same system and instant, the
-   later one wins remotely.
-2. **Writing `xfer` back to KAT's database.** The service writes to KAT's file,
-   which assumes KAT tolerates another process holding the write lock briefly.
-   Is WAL mode on? If KAT would rather we did not touch its file at all, the
-   alternative is a sidecar database tracking what we have sent.
-3. **Partial indexes on `xfer`.** Jonathan is adding these on the KAT side,
-   since they change KAT's database; we do not create them. Until then every
-   sweep scans the whole table, which is correct, just slower.
-4. **The `data` column format.** Real KAT writes a JSON object built from a
-   J4 Record (`{"temperature":22.5,"pressure":101.3}`). Remotely `data` is a
-   PostgreSQL `json` column (not `jsonb`, so the text is stored exactly as KAT
-   wrote it). A non-JSON payload is rejected by the remote and its row stays
-   unstamped. The generated fake data emits JSON too.
-5. **0MQ is not in KAT 1.0.3.** Which release will contain it, and its
-   endpoint, topic names, and whether it publishes per row or per
-   transaction. Until then transfers are triggered manually. See
-   `docs/zeromq.md`.

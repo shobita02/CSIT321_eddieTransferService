@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import KAT_SCHEMA, local_pending, remote_count
+from conftest import KAT_SCHEMA, local_pending, remote_count, remote_query
 
 from katxfer.localdb import LocalKatDb
 from katxfer.service import TransferService
@@ -35,8 +35,8 @@ def test_transfers_everything_pending(cfg):
 
     assert moved == 25
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "experimental_data") == 20
-    assert remote_count(cfg.remote.path, "environment") == 5
+    assert remote_count(cfg.remote, "experimental_data") == 20
+    assert remote_count(cfg.remote, "environment") == 5
 
 
 def test_batching_does_not_lose_rows(cfg):
@@ -44,7 +44,7 @@ def test_batching_does_not_lose_rows(cfg):
     cfg.local.batch_size = 7
     TransferService(cfg).run_once()
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "experimental_data") == 20
+    assert remote_count(cfg.remote, "experimental_data") == 20
 
 
 def test_second_run_transfers_nothing(cfg):
@@ -64,7 +64,7 @@ def test_only_new_rows_move(cfg):
     conn.close()
 
     assert TransferService(cfg).run_once() == 1
-    assert remote_count(cfg.remote.path, "experimental_data") == 21
+    assert remote_count(cfg.remote, "experimental_data") == 21
 
 
 # -- 2. idempotence ----------------------------------------------------------
@@ -82,8 +82,8 @@ def test_resend_after_crash_does_not_duplicate(cfg):
     moved = TransferService(cfg).run_once()
 
     assert moved == 25  # it really did re-send
-    assert remote_count(cfg.remote.path, "experimental_data") == 20  # no dupes
-    assert remote_count(cfg.remote.path, "environment") == 5
+    assert remote_count(cfg.remote, "experimental_data") == 20  # no dupes
+    assert remote_count(cfg.remote, "environment") == 5
 
 
 def test_identical_environment_samples_do_not_collapse(cfg):
@@ -104,7 +104,7 @@ def test_identical_environment_samples_do_not_collapse(cfg):
     TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "environment") == 6  # both kept
+    assert remote_count(cfg.remote, "environment") == 6  # both kept
 
 
 def test_repeated_environment_key_in_kat_does_not_wedge(cfg):
@@ -123,10 +123,10 @@ def test_repeated_environment_key_in_kat_does_not_wedge(cfg):
     TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "environment") == 5
-    conn = sqlite3.connect(cfg.remote.path)
-    data = conn.execute("SELECT data FROM environment ORDER BY ts LIMIT 1").fetchone()[0]
-    conn.close()
+    assert remote_count(cfg.remote, "environment") == 5
+    data = remote_query(
+        cfg.remote, "SELECT data::text FROM environment ORDER BY ts LIMIT 1"
+    )[0][0]
     assert data == '{"later": true}'
 
 
@@ -153,7 +153,7 @@ def test_two_rigs_same_instant_both_kept(cfg, tmp_path):
         cfg, local=dataclasses.replace(cfg.local, path=other)
     )
     assert TransferService(other_cfg).run_once() == 1
-    assert remote_count(cfg.remote.path, "environment") == 6
+    assert remote_count(cfg.remote, "environment") == 6
 
 
 def test_invalid_json_rejected_and_left_unstamped(cfg):
@@ -168,11 +168,13 @@ def test_invalid_json_rejected_and_left_unstamped(cfg):
     conn.commit()
     conn.close()
 
-    with pytest.raises(sqlite3.IntegrityError):
+    import psycopg2
+
+    with pytest.raises(psycopg2.DataError):  # invalid input syntax for type json
         TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 1)  # still waiting
-    assert remote_count(cfg.remote.path, "environment") == 5
+    assert remote_count(cfg.remote, "environment") == 5
 
 
 # -- 3. referential integrity ------------------------------------------------
@@ -182,20 +184,18 @@ def test_experiment_parents_arrive_first(cfg):
     """The remote has a FK from experimental_data to experiment.
 
     Experiment has no xfer column, so there is no watermark to follow; the
-    service has to fetch the parents of each batch itself. With foreign keys
-    enforced on the mock remote, getting this wrong raises instead of passing
-    quietly.
+    service has to fetch the parents of each batch itself. The remote enforces
+    the foreign key, so getting this wrong raises instead of passing quietly.
     """
     TransferService(cfg).run_once()
-    assert remote_count(cfg.remote.path, "experiment") == 2
+    assert remote_count(cfg.remote, "experiment") == 2
 
-    conn = sqlite3.connect(cfg.remote.path)
-    orphans = conn.execute(
+    orphans = remote_query(
+        cfg.remote,
         "SELECT COUNT(*) FROM experimental_data d "
         "LEFT JOIN experiment e ON e.systemid = d.systemid AND e.run = d.run "
-        "WHERE e.systemid IS NULL"
-    ).fetchone()[0]
-    conn.close()
+        "WHERE e.systemid IS NULL",
+    )[0][0]
     assert orphans == 0
 
 
@@ -209,7 +209,7 @@ def test_nothing_is_stamped_when_the_remote_fails(cfg, monkeypatch):
     def boom(self, rows, xfer):
         raise RuntimeError("remote is down")
 
-    monkeypatch.setattr(sinks.SqliteMockSink, "upsert_experimental", boom)
+    monkeypatch.setattr(sinks.PostgresSink, "upsert_experimental", boom)
 
     svc = TransferService(cfg)
     try:
@@ -223,24 +223,20 @@ def test_nothing_is_stamped_when_the_remote_fails(cfg, monkeypatch):
 
 def test_rows_are_tagged_with_origin_and_host(cfg):
     TransferService(cfg).run_once()
-    conn = sqlite3.connect(cfg.remote.path)
-    origin, host = conn.execute(
-        "SELECT origin, src_host FROM experimental_data LIMIT 1"
-    ).fetchone()
-    conn.close()
+    origin, host = remote_query(
+        cfg.remote, "SELECT origin, src_host FROM experimental_data LIMIT 1"
+    )[0]
     assert origin == "fake"  # so the archive can separate test data from real
     assert host == "testhost"
 
 
 def test_transfer_log_records_each_batch(cfg):
     TransferService(cfg).run_once()
-    conn = sqlite3.connect(cfg.remote.path)
-    rows = conn.execute(
-        "SELECT table_name, rows_sent, trigger, ok FROM transfer_log"
-    ).fetchall()
-    conn.close()
+    rows = remote_query(
+        cfg.remote, "SELECT table_name, rows_sent, trigger, ok FROM transfer_log"
+    )
     assert rows, "every committed batch should be auditable"
-    assert all(ok == 1 for *_, ok in rows)
+    assert all(ok is True for *_, ok in rows)
     assert all(trigger == "manual" for *_, trigger, _ in rows)
     assert sum(sent for _, sent, _, _ in rows) == 25
 
@@ -339,9 +335,7 @@ def test_kat_epoch_millisecond_timestamps(cfg):
     conn.close()
 
     assert TransferService(cfg).run_once() == 27
-    conn = sqlite3.connect(cfg.remote.path)
-    ts = conn.execute(
-        "SELECT ts FROM experimental_data WHERE systemid = 'CSIT321FAKE'"
-    ).fetchone()[0]
-    conn.close()
-    assert ts == "2026-10-01 23:44:06.165"  # normalised, as Postgres would store it
+    ts = remote_query(
+        cfg.remote, "SELECT ts FROM experimental_data WHERE systemid = 'CSIT321FAKE'"
+    )[0][0]
+    assert ts == parse_ts(1790898246165)  # stored as a real timestamptz

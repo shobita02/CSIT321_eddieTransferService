@@ -1,7 +1,7 @@
 """Configuration loading.
 
 Everything the service needs to know lives in one TOML file so that moving
-from "laptop + mock remote" to "laptop + Bored Owl dev server" is a config
+from "laptop + local Docker PostgreSQL" to "laptop + Bored Owl dev server" is a config
 change, not a code change.
 """
 
@@ -46,13 +46,7 @@ class ZmqConfig:
 class RemoteConfig:
     """Where rows are shipped to."""
 
-    # "postgres" once the dev server is reachable, "sqlite" for the mock.
-    kind: str = "sqlite"
-
-    # --- sqlite mock remote ---
-    path: Path | None = None
-
-    # --- postgres ---
+    # PostgreSQL: the local Docker container, or the Bored Owl dev server.
     host: str = "192.168.40.100"
     port: int = 5432
     database: str = "csit321"
@@ -114,9 +108,12 @@ def load(path: str | Path | None = None) -> ServiceConfig:
     )
 
     remote_raw = dict(raw.get("remote", {}))
+    if remote_raw.get("kind", "postgres") != "postgres":
+        raise ValueError(
+            f"remote.kind = {remote_raw['kind']!r} is no longer supported; the "
+            "SQLite mock remote was removed. Use PostgreSQL (docker compose up -d)."
+        )
     remote = RemoteConfig(
-        kind=remote_raw.get("kind", "sqlite"),
-        path=resolve(remote_raw["path"]) if remote_raw.get("path") else None,
         host=_expand(remote_raw.get("host", "192.168.40.100")),
         port=int(remote_raw.get("port", 5432)),
         database=_expand(remote_raw.get("database", "csit321")),

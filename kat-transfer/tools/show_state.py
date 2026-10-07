@@ -22,7 +22,7 @@ from katxfer.config import load as load_config  # noqa: E402
 
 
 def table(conn, title: str, sql: str, limit: int) -> None:
-    # Works for both sqlite3 and psycopg2 connections via a plain cursor.
+    # Works for both the local sqlite3 and the remote psycopg2 connection.
     cur = conn.cursor()
     cur.execute(f"{sql} LIMIT {limit}")
     cols = [d[0] for d in cur.description]
@@ -65,30 +65,23 @@ def main() -> int:
     )
     local.close()
 
-    if cfg.remote.kind == "postgres":
-        import psycopg2
+    import psycopg2
 
-        target = f"postgres {cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
-        try:
-            remote = psycopg2.connect(
-                host=cfg.remote.host,
-                port=cfg.remote.port,
-                dbname=cfg.remote.database,
-                user=cfg.remote.user,
-                password=cfg.remote.password,
-                sslmode=cfg.remote.sslmode,
-                connect_timeout=cfg.remote.connect_timeout_s,
-            )
-        except psycopg2.OperationalError as exc:
-            print(f"\n=== REMOTE {target}\n  unreachable: {exc}")
-            print("  Is the container running?  docker compose up -d")
-            return 1
-    else:
-        target = str(cfg.remote.path)
-        if not cfg.remote.path.exists():
-            print(f"\n=== REMOTE {target}\n  (does not exist yet - nothing transferred)")
-            return 0
-        remote = sqlite3.connect(cfg.remote.path)
+    target = f"postgres {cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
+    try:
+        remote = psycopg2.connect(
+            host=cfg.remote.host,
+            port=cfg.remote.port,
+            dbname=cfg.remote.database,
+            user=cfg.remote.user,
+            password=cfg.remote.password,
+            sslmode=cfg.remote.sslmode,
+            connect_timeout=cfg.remote.connect_timeout_s,
+        )
+    except psycopg2.OperationalError as exc:
+        print(f"\n=== REMOTE {target}\n  unreachable: {exc}")
+        print("  Is the container running?  docker compose up -d")
+        return 1
 
     print(f"\n=== REMOTE (archive) {target}")
     table(remote, "experiment", "SELECT systemid, run, description, origin FROM experiment", args.limit)

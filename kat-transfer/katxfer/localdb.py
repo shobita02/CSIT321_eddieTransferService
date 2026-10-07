@@ -74,8 +74,7 @@ class LocalKatDb:
         else:
             conn = sqlite3.connect(self.path, timeout=self.busy_timeout_s)
         conn.row_factory = sqlite3.Row
-        # KAT may be mid-insert and holding the write lock; wait rather than
-        # failing the whole cycle.
+        # KAT may be mid-insert and holding the write lock; wait rather than failing the whole cycle.
         conn.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_s * 1000)}")
         try:
             yield conn

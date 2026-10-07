@@ -30,65 +30,46 @@ from katxfer.config import load as load_config  # noqa: E402
 from katxfer.sinks import _iso, _ts  # noqa: E402
 
 
-def fetch_remote_experimental(cfg) -> dict[tuple, tuple]:
-    if cfg.remote.kind == "sqlite":
-        conn = sqlite3.connect(cfg.remote.path)
-        rows = conn.execute(
-            "SELECT systemid, run, row_no, data FROM experimental_data"
-        ).fetchall()
-        conn.close()
-    else:
-        import psycopg2
+def connect_remote(cfg):
+    import psycopg2
 
-        conn = psycopg2.connect(
-            host=cfg.remote.host,
-            port=cfg.remote.port,
-            dbname=cfg.remote.database,
-            user=cfg.remote.user,
-            password=cfg.remote.password,
-            sslmode=cfg.remote.sslmode,
-        )
-        with conn.cursor() as cur:
-            # data::text, or psycopg2 parses the json column into a dict and
-            # every payload compares unequal to the text KAT wrote.
-            cur.execute(
-                "SELECT systemid, run, row_no, data::text FROM experimental_data"
-            )
-            rows = cur.fetchall()
-        conn.close()
+    return psycopg2.connect(
+        host=cfg.remote.host,
+        port=cfg.remote.port,
+        dbname=cfg.remote.database,
+        user=cfg.remote.user,
+        password=cfg.remote.password,
+        sslmode=cfg.remote.sslmode,
+    )
+
+
+def fetch_remote_experimental(cfg) -> dict[tuple, str]:
+    conn = connect_remote(cfg)
+    with conn.cursor() as cur:
+        # data::text, or psycopg2 parses the json column into a dict and
+        # every payload compares unequal to the text KAT wrote.
+        cur.execute("SELECT systemid, run, row_no, data::text FROM experimental_data")
+        rows = cur.fetchall()
+    conn.close()
     return {(r[0], r[1], r[2]): r[3] for r in rows}
 
 
 def env_key(systemid: str, ts) -> tuple[str, str | None]:
     """(systemid, ts) with ts in the one text form both sides can agree on.
 
-    KAT may hold epoch ms or ISO text, the mock remote holds ISO text and
-    PostgreSQL hands back a datetime, so everything goes through _iso.
+    KAT may hold epoch ms or ISO text and PostgreSQL hands back a datetime,
+    so everything goes through _iso.
     """
     dt = ts if hasattr(ts, "astimezone") else _ts(ts)
     return (systemid.strip(), _iso(dt))
 
 
 def fetch_remote_environment(cfg) -> dict[tuple, str]:
-    if cfg.remote.kind == "sqlite":
-        conn = sqlite3.connect(cfg.remote.path)
-        rows = conn.execute("SELECT systemid, ts, data FROM environment").fetchall()
-        conn.close()
-    else:
-        import psycopg2
-
-        conn = psycopg2.connect(
-            host=cfg.remote.host,
-            port=cfg.remote.port,
-            dbname=cfg.remote.database,
-            user=cfg.remote.user,
-            password=cfg.remote.password,
-            sslmode=cfg.remote.sslmode,
-        )
-        with conn.cursor() as cur:
-            cur.execute("SELECT systemid, ts, data::text FROM environment")
-            rows = cur.fetchall()
-        conn.close()
+    conn = connect_remote(cfg)
+    with conn.cursor() as cur:
+        cur.execute("SELECT systemid, ts, data::text FROM environment")
+        rows = cur.fetchall()
+    conn.close()
     return {env_key(r[0], r[1]): r[2] for r in rows}
 
 
@@ -150,11 +131,7 @@ def main() -> int:
             print(f"           ... and {n - args.show:,} more")
 
     print(f"local : {cfg.local.path}")
-    target = (
-        cfg.remote.path
-        if cfg.remote.kind == "sqlite"
-        else f"{cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
-    )
+    target = f"{cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
     print(f"remote: {target}\n")
 
     print("ExperimentalData")

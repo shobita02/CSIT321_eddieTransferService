@@ -22,7 +22,6 @@ busy_timeout_s = 10.0
 #
 # Run with:  python -m katxfer.service -c config.live.toml --doctor
 # The Docker demo still uses config.toml, untouched.
-kind = "postgres"
 host = "192.168.40.100"
 port = 5432
 database = "${KAT_PG_DATABASE}"

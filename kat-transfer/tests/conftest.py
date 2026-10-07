@@ -1,12 +1,19 @@
 """Shared fixtures.
 
-Every test builds its own KAT database and its own mock remote in a tmp
-directory, so tests never touch data/ and can run in any order.
+Every test builds its own KAT database in a tmp directory. The remote is a
+real PostgreSQL: a `kat_test` database created in the local Docker container
+(`docker compose up -d`) from schema/remote_postgres.sql, and emptied before
+each test. The demo database (`csit321`) is never touched.
+
+Point the tests at another server with KAT_TEST_PG_HOST / _PORT / _USER /
+_PASSWORD. If PostgreSQL is unreachable, tests that need it are skipped.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,7 +31,10 @@ from katxfer.config import (  # noqa: E402
 )
 from katxfer.fakedata import fmt_ts  # noqa: E402
 
-KAT_SCHEMA = (Path(__file__).resolve().parent.parent / "schema" / "kat_sqlite.sql").read_text()
+SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
+KAT_SCHEMA = (SCHEMA_DIR / "kat_sqlite.sql").read_text()
+REMOTE_SCHEMA = (SCHEMA_DIR / "remote_postgres.sql").read_text()
+TEST_DB = "kat_test"
 
 
 def seed(db: Path, runs: int = 2, rows: int = 10, env: int = 5) -> None:
@@ -68,11 +78,71 @@ def kat_db(tmp_path: Path) -> Path:
     return db
 
 
+def _connect(remote: RemoteConfig, dbname: str | None = None):
+    import psycopg2
+
+    return psycopg2.connect(
+        host=remote.host,
+        port=remote.port,
+        dbname=dbname or remote.database,
+        user=remote.user,
+        password=remote.password,
+        connect_timeout=remote.connect_timeout_s,
+    )
+
+
+@pytest.fixture(scope="session")
+def pg_remote():
+    """Create a fresh `kat_test` database for this test session."""
+    admin = RemoteConfig(
+        host=os.environ.get("KAT_TEST_PG_HOST", "127.0.0.1"),
+        port=int(os.environ.get("KAT_TEST_PG_PORT", "5432")),
+        database="csit321",
+        user=os.environ.get("KAT_TEST_PG_USER", "kat"),
+        password=os.environ.get("KAT_TEST_PG_PASSWORD", "kat"),
+        connect_timeout_s=3,
+    )
+    try:
+        conn = _connect(admin)
+    except Exception as exc:  # noqa: BLE001 - ImportError or OperationalError
+        pytest.skip(
+            f"PostgreSQL not reachable at {admin.host}:{admin.port} ({exc}). "
+            "Start it with: docker compose up -d"
+        )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)")
+        cur.execute(f"CREATE DATABASE {TEST_DB}")
+    conn.close()
+
+    remote = dataclasses.replace(admin, database=TEST_DB)
+    conn = _connect(remote)
+    with conn.cursor() as cur:
+        cur.execute(REMOTE_SCHEMA)
+    conn.commit()
+    conn.close()
+    yield remote
+
+
 @pytest.fixture()
-def cfg(tmp_path: Path, kat_db: Path) -> ServiceConfig:
+def remote(pg_remote: RemoteConfig) -> RemoteConfig:
+    """The test database, emptied so every test starts from nothing."""
+    conn = _connect(pg_remote)
+    with conn.cursor() as cur:
+        cur.execute(
+            "TRUNCATE experiment, experimental_data, environment, transfer_log "
+            "RESTART IDENTITY CASCADE"
+        )
+    conn.commit()
+    conn.close()
+    return pg_remote
+
+
+@pytest.fixture()
+def cfg(kat_db: Path, remote: RemoteConfig) -> ServiceConfig:
     return ServiceConfig(
         local=LocalConfig(path=kat_db, batch_size=7, busy_timeout_s=5.0),
-        remote=RemoteConfig(kind="sqlite", path=tmp_path / "remote.sqlite"),
+        remote=remote,
         zmq=ZmqConfig(enabled=False),
         sweep_interval_s=1.0,
         notify_debounce_s=0.0,
@@ -81,12 +151,18 @@ def cfg(tmp_path: Path, kat_db: Path) -> ServiceConfig:
     )
 
 
-def remote_count(path: Path, table: str) -> int:
-    conn = sqlite3.connect(path)
+def remote_query(remote: RemoteConfig, sql: str) -> list[tuple]:
+    conn = _connect(remote)
     try:
-        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()
     finally:
         conn.close()
+
+
+def remote_count(remote: RemoteConfig, table: str) -> int:
+    return remote_query(remote, f"SELECT COUNT(*) FROM {table}")[0][0]
 
 
 def local_pending(path: Path) -> tuple[int, int]:

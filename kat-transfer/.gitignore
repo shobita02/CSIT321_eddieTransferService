@@ -1,4 +1,4 @@
-# Generated databases - the fake KAT database and the mock remote.
+# Generated databases - the fake KAT database.
 # Regenerate with: python3 tools/make_fake_db.py --reset
 data/*.sqlite
 data/*.sqlite-wal

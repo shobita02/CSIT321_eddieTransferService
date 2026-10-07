@@ -19,9 +19,6 @@ busy_timeout_s = 10.0
 #     host = "127.0.0.1", user = "kat", password = "kat"
 # For the Bored Owl dev server use the values below, with the credentials in
 # the environment so they never reach git.
-# kind = "sqlite" with path = "data/remote_mock.sqlite" runs without Docker.
-kind = "postgres"
-path = "data/remote_mock.sqlite"
 host = "192.168.40.100"
 port = 5432
 database = "csit321"
