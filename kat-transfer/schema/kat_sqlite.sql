@@ -34,14 +34,3 @@ CREATE TABLE IF NOT EXISTS Environment (
     data      TEXT,
     xfer      TIMESTAMP
 );
-
--- Indexes -------------------------------------------------------------------
--- NOT part of KAT's schema. These are ours, created separately by
--- tools/make_fake_db.py, because the transfer service's hot query is
--- "WHERE xfer IS NULL". Without them every sweep is a full table scan.
--- Flag these to Jonathan before go-live: they are safe to add to the real KAT
--- database (they change no semantics) but he should be the one to approve it.
-CREATE INDEX IF NOT EXISTS idx_expdata_xfer ON ExperimentalData (xfer)
-    WHERE xfer IS NULL;
-CREATE INDEX IF NOT EXISTS idx_env_xfer ON Environment (xfer)
-    WHERE xfer IS NULL;

@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from conftest import local_pending, remote_count
+from conftest import local_pending, remote_count, remote_query
 
 from katxfer.service import TransferService
 from katxfer.zmqbus import (
@@ -119,7 +119,7 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
     conn.execute(
         'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
         'data, xfer) VALUES (?,?,?,?,?,?,NULL)',
-        ("K4-RIG-01", 1, 500, "2026-10-01 11:00:00.000", "ADC-CH0", "unannounced"),
+        ("K4-RIG-01", 1, 500, "2026-10-01 11:00:00.000", "ADC-CH0", '{"unannounced": true}'),
     )
     conn.commit()
     conn.close()
@@ -130,7 +130,7 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
 
     assert moved == 26
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "experimental_data") == 21
+    assert remote_count(cfg.remote, "experimental_data") == 21
 
 
 def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
@@ -163,20 +163,20 @@ def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
 
             # run() has completed its real startup drain before polling.
             assert local_pending(cfg.local.path) == (0, 0)
-            assert remote_count(cfg.remote.path, "experimental_data") == 20
-            assert remote_count(cfg.remote.path, "environment") == 5
+            assert remote_count(cfg.remote, "experimental_data") == 20
+            assert remote_count(cfg.remote, "environment") == 5
             conn = sqlite3.connect(cfg.local.path)
             try:
                 conn.execute(
                     'INSERT INTO ExperimentalData (systemid, run, "row", '
                     'timestamp, source, data, xfer) VALUES (?,?,?,?,?,?,NULL)',
                     ("K4-RIG-01", 1, 999, "2026-10-01 11:00:00.000",
-                     "ADC-CH0", "new experimental"),
+                     'ADC-CH0', '{"message": "new experimental"}'),
                 )
                 conn.execute(
                     "INSERT INTO Environment (systemid, timestamp, data, xfer) "
                     "VALUES (?,?,?,NULL)",
-                    ("K4-RIG-01", "2026-10-01 11:00:00.000", "new environment"),
+                    ("K4-RIG-01", '2026-10-01 11:00:00.000', '{"message": "new environment"}'),
                 )
                 conn.commit()
             finally:
@@ -202,18 +202,15 @@ def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
     assert sub.polls == 2
     assert sub.closed
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote.path, "experimental_data") == 21
-    assert remote_count(cfg.remote.path, "environment") == 6
-    assert remote_count(cfg.remote.path, "experiment") == 2
+    assert remote_count(cfg.remote, "experimental_data") == 21
+    assert remote_count(cfg.remote, "environment") == 6
+    assert remote_count(cfg.remote, "experiment") == 2
 
-    conn = sqlite3.connect(cfg.remote.path)
-    try:
-        return conn.execute(
-            "SELECT table_name, rows_sent, trigger, ok FROM transfer_log "
-            "WHERE trigger != 'startup'"
-        ).fetchall()
-    finally:
-        conn.close()
+    return remote_query(
+        cfg.remote,
+        "SELECT table_name, rows_sent, trigger, ok FROM transfer_log "
+        "WHERE trigger != 'startup'",
+    )
 
 
 def test_run_transfers_on_zmq_notification(cfg, monkeypatch):
@@ -221,8 +218,8 @@ def test_run_transfers_on_zmq_notification(cfg, monkeypatch):
     rows = _run_with_fake_subscriber(cfg, monkeypatch, notify=True)
 
     assert sorted(rows) == [
-        ("environment", 1, "zmq", 1),
-        ("experimental_data", 1, "zmq", 1),
+        ("environment", 1, "zmq", True),
+        ("experimental_data", 1, "zmq", True),
     ]
 
 
@@ -231,6 +228,6 @@ def test_run_sweep_recovers_without_notification(cfg, monkeypatch):
     rows = _run_with_fake_subscriber(cfg, monkeypatch, notify=False)
 
     assert sorted(rows) == [
-        ("environment", 1, "sweep", 1),
-        ("experimental_data", 1, "sweep", 1),
+        ("environment", 1, "sweep", True),
+        ("experimental_data", 1, "sweep", True),
     ]

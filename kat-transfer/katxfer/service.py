@@ -204,7 +204,7 @@ class TransferService:
         log.info(
             "local=%s remote=%s origin=%s sweep=%.0fs",
             self.cfg.local.path,
-            self.cfg.remote.kind,
+            f"{self.cfg.remote.host}:{self.cfg.remote.port}/{self.cfg.remote.database}",
             self.cfg.origin,
             self.cfg.sweep_interval_s,
         )
@@ -297,11 +297,8 @@ class TransferService:
         try:
             sink = self._sink_or_connect()
             remote = sink.counts()
-            target = (
-                self.cfg.remote.path
-                if self.cfg.remote.kind == "sqlite"
-                else f"{self.cfg.remote.host}:{self.cfg.remote.port}/{self.cfg.remote.database}"
-            )
+            r = self.cfg.remote
+            target = f"{r.host}:{r.port}/{r.database}"
             lines.append(f"remote : {target}")
             for table, n in remote.items():
                 lines.append(f"  {table:<24} : {n}")
@@ -347,7 +344,7 @@ def doctor(config_path: Path | None) -> str:
         return f"  [ok]      {package:<16} {raw.split()[0]}"
 
     lines.append(probe("zmq", "pyzmq", "0MQ notifications (optional)"))
-    lines.append(probe("psycopg2", "psycopg2-binary", "remote.kind = postgres"))
+    lines.append(probe("psycopg2", "psycopg2-binary", "the PostgreSQL remote"))
     lines.append(probe("sqlite3", "sqlite3", "everything (standard library)"))
 
     if any("[MISSING]" in line for line in lines):
@@ -369,7 +366,8 @@ def doctor(config_path: Path | None) -> str:
         f"config     : {config_path or DEFAULT_CONFIG_PATH}",
         f"  local KAT db   : {cfg.local.path}"
         + ("" if cfg.local.path.exists() else "   <-- DOES NOT EXIST"),
-        f"  remote         : {cfg.remote.kind}",
+        f"  remote         : {cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
+        f" as {cfg.remote.user or '(no user)'}",
         f"  0MQ enabled    : {cfg.zmq.enabled}",
         f"  sweep interval : {cfg.sweep_interval_s:.0f}s",
     ]

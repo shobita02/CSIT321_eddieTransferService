@@ -19,13 +19,7 @@ busy_timeout_s = 10.0
 # `docker compose up -d` (see docker-compose.yml). These credentials belong to
 # that throwaway container only.
 #
-# To go live, change host to "192.168.40.100" and user/password to
-# "${KAT_PG_USER}" / "${KAT_PG_PASSWORD}" (read from the environment).
-#
-# kind = "sqlite" with path = "data/remote_mock.sqlite" still works if you
-# need to run without Docker.
-kind = "postgres"
-path = "data/remote_mock.sqlite"
+# For the live server use config.live.toml instead.
 host = "127.0.0.1"
 port = 5432
 database = "csit321"
