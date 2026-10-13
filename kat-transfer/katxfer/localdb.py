@@ -137,16 +137,19 @@ class LocalKatDb:
         """
         if not keys:
             return []
-        clause = " OR ".join(["(systemid = ? AND run = ?)"] * len(keys))
-        params: list[object] = []
-        for sid, run in sorted(keys):
-            params.extend([sid, run])
-        sql = f"SELECT systemid, run, description FROM Experiment WHERE {clause}"
+        ordered = sorted(keys)
+        rows = []
         with self.connect(readonly=True) as conn:
-            return [
-                ExperimentRow(r["systemid"], r["run"], r["description"])
-                for r in conn.execute(sql, params)
-            ]
+            # A 1000-row API batch may reference 1000 different runs. Keep
+            # queries below SQLite's expression-depth and older variable limits.
+            for start in range(0, len(ordered), 400):
+                chunk = ordered[start:start + 400]
+                clause = " OR ".join(["(systemid = ? AND run = ?)"] * len(chunk))
+                params = [value for key in chunk for value in key]
+                sql = f"SELECT systemid, run, description FROM Experiment WHERE {clause}"
+                rows.extend(ExperimentRow(r["systemid"], r["run"], r["description"])
+                            for r in conn.execute(sql, params))
+        return rows
 
     def pending_counts(self) -> dict[str, int]:
         with self.connect(readonly=True) as conn:

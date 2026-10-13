@@ -12,6 +12,7 @@ import sqlite3
 import time
 
 import pytest
+import zmq
 
 from conftest import local_pending, remote_count
 
@@ -23,13 +24,17 @@ from katxfer.zmqbus import (
     Subscriber,
 )
 
-ENDPOINT = "tcp://127.0.0.1:55571"
+def new_publisher():
+    # Fixed high ports can be occupied or reserved by Windows/Docker.
+    pub = Publisher("tcp://127.0.0.1:*")
+    endpoint = pub._sock.getsockopt_string(zmq.LAST_ENDPOINT)
+    return pub, endpoint
 
 
 @pytest.fixture()
 def pubsub():
-    pub = Publisher(ENDPOINT.replace("127.0.0.1", "*"))
-    sub = Subscriber(ENDPOINT, topics=[""])
+    pub, endpoint = new_publisher()
+    sub = Subscriber(endpoint, topics=[""])
     time.sleep(0.3)  # let the subscription handshake finish (slow joiner)
     yield pub, sub
     sub.close()
@@ -62,8 +67,8 @@ def test_notification_round_trip(pubsub):
 
 def test_topic_filtering_is_a_prefix_match():
     """SUB filters on a byte prefix, which is why topics are dotted strings."""
-    pub = Publisher("tcp://*:55572")
-    sub = Subscriber("tcp://127.0.0.1:55572", topics=[TOPIC_ENVIRONMENT])
+    pub, endpoint = new_publisher()
+    sub = Subscriber(endpoint, topics=[TOPIC_ENVIRONMENT])
     time.sleep(0.3)
     try:
         pub.send(TOPIC_EXPERIMENTAL, {"ignored": True})
@@ -94,10 +99,10 @@ def test_notifications_sent_before_subscribing_are_lost():
     This is why the service cannot treat a notification as a delivery
     guarantee, and why `sweep_interval_s` exists.
     """
-    pub = Publisher("tcp://*:55573")
+    pub, endpoint = new_publisher()
     pub.send(TOPIC_EXPERIMENTAL, {"sent": "before anyone was listening"})
 
-    sub = Subscriber("tcp://127.0.0.1:55573", topics=[""])
+    sub = Subscriber(endpoint, topics=[""])
     time.sleep(0.3)
     try:
         assert drain(sub, timeout_s=0.5) == []
@@ -106,14 +111,14 @@ def test_notifications_sent_before_subscribing_are_lost():
         pub.close()
 
 
-def test_notifications_lost_while_away_are_still_transferred(cfg):
+def test_notifications_lost_while_away_are_still_transferred(cfg, remote):
     """The property that makes losing notifications survivable.
 
     Rows are written with no subscriber connected, so every notification about
     them is gone. The service still finds them, because it asks the database
     what is pending rather than trusting the message stream.
     """
-    pub = Publisher("tcp://*:55574")
+    pub, _ = new_publisher()
     conn = sqlite3.connect(cfg.local.path)
     conn.execute(
         'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
@@ -129,4 +134,4 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
 
     assert moved == 26
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 21
+    assert remote_count(remote, "experimental_data") == 21

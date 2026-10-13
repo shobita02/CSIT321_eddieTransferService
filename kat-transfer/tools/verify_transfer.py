@@ -27,31 +27,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from katxfer.config import load as load_config  # noqa: E402
-from katxfer.sinks import _iso, _ts  # noqa: E402
-
-
-def connect_remote(cfg):
-    import psycopg2
-
-    return psycopg2.connect(
-        host=cfg.remote.host,
-        port=cfg.remote.port,
-        dbname=cfg.remote.database,
-        user=cfg.remote.user,
-        password=cfg.remote.password,
-        sslmode=cfg.remote.sslmode,
-    )
+from katxfer.sinks import HttpSink, _iso, _ts  # noqa: E402
 
 
 def fetch_remote_experimental(cfg) -> dict[tuple, str]:
-    conn = connect_remote(cfg)
-    with conn.cursor() as cur:
-        # data::text, or psycopg2 parses the json column into a dict and
-        # every payload compares unequal to the text KAT wrote.
-        cur.execute("SELECT systemid, run, row_no, data::text FROM experimental_data")
-        rows = cur.fetchall()
-    conn.close()
-    return {(r[0], r[1], r[2]): r[3] for r in rows}
+    with HttpSink(cfg.remote, cfg.origin, cfg.src_host) as sink:
+        return {(r["systemid"], r["run"], r["row_no"]): r["data"]
+                for r in sink.records("experimental-data")}
 
 
 def env_key(systemid: str, ts) -> tuple[str, str | None]:
@@ -65,12 +47,9 @@ def env_key(systemid: str, ts) -> tuple[str, str | None]:
 
 
 def fetch_remote_environment(cfg) -> dict[tuple, str]:
-    conn = connect_remote(cfg)
-    with conn.cursor() as cur:
-        cur.execute("SELECT systemid, ts, data::text FROM environment")
-        rows = cur.fetchall()
-    conn.close()
-    return {env_key(r[0], r[1]): r[2] for r in rows}
+    with HttpSink(cfg.remote, cfg.origin, cfg.src_host) as sink:
+        return {env_key(r["systemid"], r["ts"]): r["data"]
+                for r in sink.records("environment")}
 
 
 def main() -> int:
@@ -131,7 +110,7 @@ def main() -> int:
             print(f"           ... and {n - args.show:,} more")
 
     print(f"local : {cfg.local.path}")
-    target = f"{cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
+    target = cfg.remote.url
     print(f"remote: {target}\n")
 
     print("ExperimentalData")

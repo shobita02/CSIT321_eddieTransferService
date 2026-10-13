@@ -1,0 +1,20 @@
+# Administrator template. Adjust paths if the checkout is stored elsewhere.
+# Create .env.live.json with the launcher; keep it private to chrisw.
+[Unit]
+Description=CSIT321 KAT gateway and API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chrisw
+WorkingDirectory=/home/chrisw/csit321-gateway/kat-transfer
+ExecStart=/home/chrisw/csit321-gateway/kat-transfer/.venv/bin/python -m katgateway --settings /home/chrisw/csit321-gateway/kat-transfer/.env.live.json --port 8001 --root-path /csit321
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

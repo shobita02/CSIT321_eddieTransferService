@@ -1,26 +1,14 @@
-"""Remote sinks.
-
-`PostgresSink` writes to the PostgreSQL archive: the local Docker container
-for development and tests, or the Bored Owl dev server for real. Both are
-built from schema/remote_postgres.sql, so they behave identically.
-
-Every write is an upsert on a key the client can compute, which is what makes
-the "stamp xfer only after remote commit" ordering safe: a replayed batch
-updates rows that are already there instead of duplicating them.
-"""
+"""HTTP archive sink. No PostgreSQL driver or SQL is used by the client."""
 
 from __future__ import annotations
-
-import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
-
+import httpx
+import ssl
 from .config import RemoteConfig
 from .fakedata import parse_ts
 from .localdb import EnvironmentRow, ExperimentalRow, ExperimentRow
-
-log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,6 +22,9 @@ class RemoteSink(ABC):
         self.origin = origin
         self.src_host = src_host
 
+    def begin_batch(self, started_at: datetime, trigger: str) -> None:
+        pass
+
     @abstractmethod
     def connect(self) -> None: ...
 
@@ -44,26 +35,14 @@ class RemoteSink(ABC):
     def upsert_experiments(self, rows: list[ExperimentRow]) -> WriteResult: ...
 
     @abstractmethod
-    def upsert_experimental(
-        self, rows: list[ExperimentalRow], xfer: datetime
-    ) -> WriteResult: ...
+    def upsert_experimental(self, rows: list[ExperimentalRow], xfer: datetime) -> WriteResult: ...
 
     @abstractmethod
-    def upsert_environment(
-        self, rows: list[EnvironmentRow], xfer: datetime
-    ) -> WriteResult: ...
+    def upsert_environment(self, rows: list[EnvironmentRow], xfer: datetime) -> WriteResult: ...
 
     @abstractmethod
-    def log_transfer(
-        self,
-        started_at: datetime,
-        table_name: str,
-        rows_sent: int,
-        rows_applied: int,
-        trigger: str,
-        ok: bool,
-        detail: str | None = None,
-    ) -> None: ...
+    def log_transfer(self, started_at: datetime, table_name: str, rows_sent: int,
+                     rows_applied: int, trigger: str, ok: bool, detail: str | None = None) -> None: ...
 
     @abstractmethod
     def counts(self) -> dict[str, int]: ...
@@ -77,7 +56,6 @@ class RemoteSink(ABC):
 
 
 def _ts(value: str | int | None) -> datetime | None:
-    # KAT stores epoch milliseconds; generated data stores ISO text.
     return parse_ts(value) if value is not None and value != "" else None
 
 
@@ -87,180 +65,117 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
-# ---------------------------------------------------------------------------
-# PostgreSQL
-# ---------------------------------------------------------------------------
+def _wire_ts(value: str | int | None) -> str | None:
+    dt = _ts(value)
+    return dt.isoformat() if dt is not None else None
 
 
-class PostgresSink(RemoteSink):
+class GatewayError(RuntimeError):
+    """The gateway did not confirm a committed write."""
+
+
+class HttpSink(RemoteSink):
     def __init__(self, cfg: RemoteConfig, origin: str, src_host: str) -> None:
         super().__init__(origin, src_host)
         self.cfg = cfg
-        self._conn = None
+        self._client: httpx.Client | None = None
+        self.begin_batch(datetime.now(timezone.utc), "manual")
+
+    def begin_batch(self, started_at: datetime, trigger: str) -> None:
+        self.started_at = started_at
+        self.trigger = trigger
 
     def connect(self) -> None:
-        import psycopg2  # imported late so --doctor works without the driver
-
-        self._conn = psycopg2.connect(
-            host=self.cfg.host,
-            port=self.cfg.port,
-            dbname=self.cfg.database,
-            user=self.cfg.user,
-            password=self.cfg.password,
-            sslmode=self.cfg.sslmode,
-            connect_timeout=self.cfg.connect_timeout_s,
-            application_name="kat-transfer",
-        )
-        self._conn.autocommit = False
-        log.info(
-            "connected to postgres %s:%s/%s",
-            self.cfg.host,
-            self.cfg.port,
-            self.cfg.database,
+        # TLS verification is enabled. Redirects cannot forward the token.
+        self._client = httpx.Client(
+            base_url=self.cfg.url + "/", timeout=self.cfg.timeout_s,
+            headers={"Authorization": "Bearer " + self.cfg.token},
+            follow_redirects=False, trust_env=False,
+            verify=ssl.create_default_context(cafile=self.cfg.ca_file) if self.cfg.ca_file else True,
         )
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def request(self, method: str, path: str, **kwargs) -> dict:
+        if self._client is None:
+            raise GatewayError("Gateway connection is not open")
+        try:
+            response = self._client.request(method, path.lstrip("/"), **kwargs)
+        except httpx.HTTPError as exc:
+            raise GatewayError("Gateway connection failed; pending rows will be retried") from exc
+        if response.status_code != 200:
+            # Do not echo arbitrary server bodies, local data or credentials.
+            raise GatewayError(f"Gateway returned HTTP {response.status_code}; write not confirmed")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise GatewayError("Gateway returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise GatewayError("Gateway returned an invalid response")
+        return result
+
+    def _write(self, table: str, rows: list[dict], xfer: datetime | None = None) -> WriteResult:
+        if not rows:
+            return WriteResult(0, 0)
+        body = {
+            "origin": self.origin, "src_host": self.src_host,
+            "started_at": self.started_at.isoformat(), "trigger": self.trigger, "rows": rows,
+        }
+        if xfer is not None:
+            body["xfer"] = xfer.isoformat()
+        result = self.request("POST", f"v1/ingest/{table}", json=body)
+        sent, applied = result.get("sent"), result.get("applied")
+        if (result.get("committed") is not True or type(sent) is not int
+                or sent != len(rows) or type(applied) is not int or not 0 < applied <= sent):
+            raise GatewayError("Gateway did not acknowledge the complete committed batch")
+        return WriteResult(sent, applied)
 
     def upsert_experiments(self, rows: list[ExperimentRow]) -> WriteResult:
-        if not rows:
-            return WriteResult(0, 0)
-        from psycopg2.extras import execute_values
+        return self._write("experiments", [
+            {"systemid": r.systemid, "run": r.run, "description": r.description} for r in rows
+        ])
 
-        sql = """
-            INSERT INTO experiment
-                (systemid, run, description, origin, src_host)
-            VALUES %s
-            ON CONFLICT (systemid, run) DO UPDATE SET
-                description = EXCLUDED.description,
-                origin      = EXCLUDED.origin,
-                src_host    = EXCLUDED.src_host
-        """
-        values = [
-            (r.systemid, r.run, r.description, self.origin, self.src_host)
-            for r in rows
-        ]
-        with self._conn.cursor() as cur:
-            execute_values(cur, sql, values, page_size=500)
-            applied = cur.rowcount
-        self._conn.commit()
-        return WriteResult(len(values), applied)
+    def upsert_experimental(self, rows: list[ExperimentalRow], xfer: datetime) -> WriteResult:
+        return self._write("experimental-data", [
+            {"systemid": r.systemid, "run": r.run, "row_no": r.row_no,
+             "ts": _wire_ts(r.ts), "source": r.source, "data": r.data} for r in rows
+        ], xfer)
 
-    def upsert_experimental(
-        self, rows: list[ExperimentalRow], xfer: datetime
-    ) -> WriteResult:
-        if not rows:
-            return WriteResult(0, 0)
-        from psycopg2.extras import execute_values
+    def upsert_environment(self, rows: list[EnvironmentRow], xfer: datetime) -> WriteResult:
+        return self._write("environment", [
+            {"systemid": r.systemid, "ts": _wire_ts(r.ts), "data": r.data} for r in rows
+        ], xfer)
 
-        sql = """
-            INSERT INTO experimental_data
-                (systemid, run, row_no, ts, source, data, xfer, origin, src_host)
-            VALUES %s
-            ON CONFLICT (systemid, run, row_no) DO UPDATE SET
-                ts       = EXCLUDED.ts,
-                source   = EXCLUDED.source,
-                data     = EXCLUDED.data,
-                xfer     = EXCLUDED.xfer,
-                origin   = EXCLUDED.origin,
-                src_host = EXCLUDED.src_host
-        """
-        values = [
-            (
-                r.systemid,
-                r.run,
-                r.row_no,
-                _ts(r.ts),
-                r.source,
-                r.data,
-                xfer,
-                self.origin,
-                self.src_host,
-            )
-            for r in rows
-        ]
-        with self._conn.cursor() as cur:
-            execute_values(cur, sql, values, page_size=500)
-            applied = cur.rowcount
-        self._conn.commit()
-        return WriteResult(len(values), applied)
-
-    def upsert_environment(
-        self, rows: list[EnvironmentRow], xfer: datetime
-    ) -> WriteResult:
-        if not rows:
-            return WriteResult(0, 0)
-        from psycopg2.extras import execute_values
-
-        sql = """
-            INSERT INTO environment
-                (systemid, ts, data, xfer, origin, src_host)
-            VALUES %s
-            ON CONFLICT (systemid, ts) DO UPDATE SET
-                data     = EXCLUDED.data,
-                xfer     = EXCLUDED.xfer,
-                origin   = EXCLUDED.origin,
-                src_host = EXCLUDED.src_host
-        """
-        # KAT's Environment has no unique constraint, so a batch can repeat a
-        # (systemid, ts) key. ON CONFLICT cannot update the same row twice in
-        # one statement, so keep the last one -- the only one a keyed remote
-        # table can hold.
-        seen: dict[tuple, tuple] = {}
-        for r in rows:
-            ts = _ts(r.ts)
-            seen[(r.systemid, ts)] = (
-                r.systemid, ts, r.data, xfer, self.origin, self.src_host
-            )
-        values = list(seen.values())
-        with self._conn.cursor() as cur:
-            execute_values(cur, sql, values, page_size=500)
-            applied = cur.rowcount
-        self._conn.commit()
-        return WriteResult(len(rows), applied)
-
-    def log_transfer(
-        self,
-        started_at: datetime,
-        table_name: str,
-        rows_sent: int,
-        rows_applied: int,
-        trigger: str,
-        ok: bool,
-        detail: str | None = None,
-    ) -> None:
-        sql = """
-            INSERT INTO transfer_log
-                (started_at, src_host, table_name, rows_sent, rows_applied,
-                 trigger, ok, detail)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        with self._conn.cursor() as cur:
-            cur.execute(
-                sql,
-                (
-                    started_at,
-                    self.src_host,
-                    table_name,
-                    rows_sent,
-                    rows_applied,
-                    trigger,
-                    ok,
-                    detail,
-                ),
-            )
-        self._conn.commit()
+    def log_transfer(self, started_at: datetime, table_name: str, rows_sent: int,
+                     rows_applied: int, trigger: str, ok: bool, detail: str | None = None) -> None:
+        # The gateway writes the audit record in the data transaction. A second
+        # call here could fail after SQLite has already been stamped.
+        pass
 
     def counts(self) -> dict[str, int]:
-        out = {}
-        with self._conn.cursor() as cur:
-            for table in ("experiment", "experimental_data", "environment"):
-                cur.execute(f"SELECT COUNT(*) FROM {table}")
-                out[table] = cur.fetchone()[0]
-        return out
+        counts = self.request("GET", "v1/status").get("counts")
+        tables = {"experiment", "experimental_data", "environment"}
+        if (not isinstance(counts, dict) or set(counts) != tables
+                or any(type(n) is not int or n < 0 for n in counts.values())):
+            raise GatewayError("Gateway returned invalid archive counts")
+        return counts
+
+    def records(self, resource: str, **filters):
+        """Iterate bounded read pages, for verification and diagnostic tools."""
+        offset = 0
+        while True:
+            page = self.request("GET", f"v1/{resource}", params={**filters, "limit": 1000, "offset": offset})
+            rows = page.get("items")
+            if not isinstance(rows, list):
+                raise GatewayError("Gateway returned an invalid read page")
+            yield from rows
+            if len(rows) < 1000:
+                return
+            offset += len(rows)
 
 
 def build_sink(cfg: RemoteConfig, origin: str, src_host: str) -> RemoteSink:
-    return PostgresSink(cfg, origin, src_host)
+    return HttpSink(cfg, origin, src_host)

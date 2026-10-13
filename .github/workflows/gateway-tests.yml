@@ -1,0 +1,31 @@
+name: Gateway and transfer tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kat-transfer
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: csit321
+          POSTGRES_USER: kat
+          POSTGRES_PASSWORD: kat-local-demo-only
+        ports:
+          - 25432:5432
+        options: >-
+          --health-cmd "pg_isready -U kat -d csit321"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      KAT_REQUIRE_PG: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q

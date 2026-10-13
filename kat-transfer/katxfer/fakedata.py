@@ -40,6 +40,12 @@ def parse_ts(text: str | int | float) -> datetime:
         return None
     if isinstance(text, (int, float)) or text.strip().isdigit():
         return datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
+    # Gateway reads use ISO 8601 with an explicit UTC offset.
+    try:
+        parsed = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
     text = text.strip().replace("T", " ")
     if text.endswith("Z"):
         text = text[:-1]

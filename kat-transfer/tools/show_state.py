@@ -22,7 +22,7 @@ from katxfer.config import load as load_config  # noqa: E402
 
 
 def table(conn, title: str, sql: str, limit: int) -> None:
-    # Works for both the local sqlite3 and the remote psycopg2 connection.
+    # Used only for the local SQLite connection; archive reads use HTTP below.
     cur = conn.cursor()
     cur.execute(f"{sql} LIMIT {limit}")
     cols = [d[0] for d in cur.description]
@@ -65,57 +65,23 @@ def main() -> int:
     )
     local.close()
 
-    import psycopg2
+    from katxfer.sinks import HttpSink, GatewayError
 
-    target = f"postgres {cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
     try:
-        remote = psycopg2.connect(
-            host=cfg.remote.host,
-            port=cfg.remote.port,
-            dbname=cfg.remote.database,
-            user=cfg.remote.user,
-            password=cfg.remote.password,
-            sslmode=cfg.remote.sslmode,
-            connect_timeout=cfg.remote.connect_timeout_s,
-        )
-    except psycopg2.OperationalError as exc:
-        print(f"\n=== REMOTE {target}\n  unreachable: {exc}")
-        print("  Is the container running?  docker compose up -d")
+        with HttpSink(cfg.remote, cfg.origin, cfg.src_host) as sink:
+            print(f"\nREMOTE (gateway) {cfg.remote.url}")
+            print("  Counts:", sink.counts())
+            for resource in ("experiments", "experimental-data", "environment", "transfers"):
+                page = sink.request("GET", f"v1/{resource}",
+                                    params={"limit": min(args.limit, 1000), "offset": 0})
+                print(f"\n{resource}")
+                for row in page["items"]:
+                    print(" ", row)
+                if not page["items"]:
+                    print("  (no rows)")
+    except GatewayError as exc:
+        print(f"Gateway unavailable: {exc}")
         return 1
-
-    print(f"\n=== REMOTE (archive) {target}")
-    table(remote, "experiment", "SELECT systemid, run, description, origin FROM experiment", args.limit)
-    table(
-        remote,
-        "experimental_data",
-        "SELECT systemid, run, row_no, ts, data, xfer FROM experimental_data "
-        "ORDER BY systemid, run, row_no",
-        args.limit,
-    )
-    table(
-        remote,
-        "environment",
-        "SELECT systemid, ts, data, xfer FROM environment ORDER BY systemid, ts",
-        args.limit,
-    )
-    table(
-        remote,
-        "Duplicate check (total rows must equal distinct keys)",
-        "SELECT 'experimental_data' AS tbl, COUNT(*) AS total_rows, "
-        "(SELECT COUNT(*) FROM (SELECT DISTINCT systemid, run, row_no FROM experimental_data) AS k) AS distinct_keys "
-        "FROM experimental_data "
-        "UNION ALL SELECT 'environment', COUNT(*), "
-        "(SELECT COUNT(*) FROM (SELECT DISTINCT systemid, ts FROM environment) AS k) "
-        "FROM environment",
-        args.limit,
-    )
-    table(
-        remote,
-        "transfer_log (one line per batch the service committed)",
-        "SELECT id, started_at, table_name, rows_sent, trigger FROM transfer_log ORDER BY id",
-        args.limit,
-    )
-    remote.close()
     return 0
 
 

@@ -1,0 +1,5 @@
+# Explicit opt-in for integration tests. Normal deployment publishes no DB port.
+services:
+  remote-db:
+    ports:
+      - "127.0.0.1:25432:5432"

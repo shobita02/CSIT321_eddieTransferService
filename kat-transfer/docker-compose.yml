@@ -1,35 +1,41 @@
-# Local PostgreSQL standing in for the archive on the Bored Owl dev server.
-#
-#   docker compose up -d          start it (first start loads the schema)
-#   docker compose down -v        stop it AND wipe the data, for a clean demo
-#
-# The schema in schema/remote_postgres.sql is loaded automatically the first
-# time the volume is created, so this database has exactly the tables, keys
-# and constraints the real server will have.
-#
-# The credentials below are for this throwaway local container only, which is
-# why they are fine to commit. It listens on 127.0.0.1, so nothing outside this
-# machine can reach it. The real server's credentials stay in the environment
-# (see config.example.toml).
-
+# Local demo: NGINX is the only published service. PostgreSQL stays private.
+name: kat-gateway-dev
 services:
   remote-db:
     image: postgres:16
-    container_name: kat-remote-pg
     environment:
-      POSTGRES_DB: csit321
-      POSTGRES_USER: kat
-      POSTGRES_PASSWORD: kat
-    ports:
-      - "127.0.0.1:5432:5432"
+      POSTGRES_DB: ${KAT_PG_DATABASE:-csit321}
+      POSTGRES_USER: ${KAT_PG_USER:-kat}
+      POSTGRES_PASSWORD: ${KAT_PG_PASSWORD:?Create .env with tools/new_demo_env.py}
     volumes:
-      - kat-remote-pg-data:/var/lib/postgresql/data
+      - kat-gateway-pg-data:/var/lib/postgresql/data
       - ./schema/remote_postgres.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kat -d csit321"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 2s
       timeout: 3s
-      retries: 15
-
+      retries: 30
+  gateway:
+    build: .
+    restart: unless-stopped
+    environment:
+      KAT_PG_HOST: remote-db
+      KAT_PG_DATABASE: ${KAT_PG_DATABASE:-csit321}
+      KAT_PG_USER: ${KAT_PG_USER:-kat}
+      KAT_PG_PASSWORD: ${KAT_PG_PASSWORD:?Create .env}
+      KAT_PG_SSLMODE: disable
+      KAT_API_WRITE_TOKEN: ${KAT_API_WRITE_TOKEN:?Generate a write token}
+      KAT_API_READ_TOKEN: ${KAT_API_READ_TOKEN:?Generate a read token}
+    depends_on:
+      remote-db:
+        condition: service_healthy
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - gateway
 volumes:
-  kat-remote-pg-data:
+  kat-gateway-pg-data:
