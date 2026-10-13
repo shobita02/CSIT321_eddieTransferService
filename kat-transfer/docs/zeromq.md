@@ -7,18 +7,6 @@ and how this service uses it.
 
 ## What KAT 1.0.3 actually does (checked 2 October 2026)
 
-**KAT 1.0.3 does not publish 0MQ notifications.** 1.0.3 is the newest release
-on [github.com/boredowl-public/KAT/releases](https://github.com/boredowl-public/KAT/releases),
-and its release notes (and those of 1.0.0–1.0.2) do not mention 0MQ. The
-installed program was checked directly:
-
-| Where we looked | What we found |
-|---|---|
-| `plugins/` (every bundled JAR) | No ZeroMQ or JeroMQ library. KAT's own `au.com.boredowl.kat_1.0.3.jar` declares its dependencies in `META-INF/MANIFEST.MF` and `pom.xml`: sqlite-jdbc, postgresql, jSerialComm, gson — no 0MQ. |
-| Class names and string constants inside that JAR | Nothing matching `zmq`, `ZeroMQ`, `tcp://`, `ipc://` or `publish`. |
-| `KAT.exe`, `KATc.exe`, `Kairos4th.exe` | No libzmq symbols (`zmq_`, `ZMTP`, `CURVE`), so it is not statically linked into the native terminal either. |
-| Live sockets while KAT was running (`netstat -ano`) | Only `Kairos4th.exe` listening on `127.0.0.1:4094`, with KAT connected to it — the local terminal link, not a publisher. |
-| `KATDataStore` / `DataWords` (the classes behind `experiment`, `ed-insert`, `env-record`) | They write to SQLite on a single "KAT experimental-data writer" thread and do nothing else after the insert. |
 
 The same inspection confirmed the database facts the service relies on: the
 file is always `<user.home>/katdata.db`, its CREATE TABLE statements match
@@ -129,10 +117,7 @@ working whatever Jonathan's names turn out to be, and the body is ignored
 entirely — only the fact that a message arrived matters. When the real names are
 known, narrow the `topics` list in `config.toml`. No code changes.
 
-## Questions for Jonathan
-
-0. KAT 1.0.3 contains no 0MQ publisher (see the table at the top). Which
-   release will it be in, and roughly when?
+## Question?
 1. What endpoint does KAT's publisher bind to — is `tcp://127.0.0.1:5556` right,
    and is it configurable?
 2. What are the real topic names?

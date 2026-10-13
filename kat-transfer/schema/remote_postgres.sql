@@ -3,7 +3,7 @@
 -- Run once as the owner of the target database:
 --     psql -h 192.168.40.100 -U <you> -d csit321 -f schema/remote_postgres.sql
 --
--- Design notes (worth walking through with Jonathan):
+-- Design notes
 --
 --  1. Unquoted identifiers are folded to lower case by PostgreSQL, so KAT's
 --     `ExperimentalData` becomes `experimentaldata`. We use explicit
@@ -14,18 +14,20 @@
 --     `row_no` remotely and map it in the transfer service, so no query in
 --     the API layer ever has to remember to quote an identifier.
 --
---  3. `Environment` has no unique constraint in KAT, so there is no natural
---     key to upsert against. We derive `digest` = sha256(systemid|timestamp|
---     data) in the transfer client and make that the conflict target. Two
---     byte-identical environment samples for the same system at the same
---     instant are therefore collapsed into one remote row. That is almost
---     certainly the desired behaviour, but it IS a behaviour change and
---     Jonathan should sign off on it. The alternative is asking for a UNIQUE
---     (systemid, timestamp) on the KAT side.
+--  3. `environment` is keyed on the timestamp, together with systemid: the
+--     archive collects from several rigs, and two rigs sampling at the same
+--     instant must not overwrite each other. Samples with identical data at
+--     different instants are separate rows and are never collapsed. KAT's own
+--     Environment table has no unique constraint, so IF it ever holds two
+--     rows for the same system and instant, the later one wins here.
 --
 --  4. Provenance columns (`origin`, `src_host`, `ingested_at`) implement the
 --     meeting action "need to add transferred, real/fake data, source to
 --     database as columns" (11/09/26, item 2).
+--
+--  5. `data` is `json`, not `jsonb`. `json` validates the payload but stores
+--     the text exactly as KAT wrote it, so tools/verify_transfer.py can compare
+--     local and remote payloads byte for byte. `jsonb` would reorder keys.
 
 CREATE TABLE IF NOT EXISTS experiment (
     systemid     VARCHAR(20)  NOT NULL,
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS experimental_data (
     row_no       INTEGER      NOT NULL,
     ts           TIMESTAMPTZ,
     source       VARCHAR(20),
-    data         TEXT,
+    data         JSON,
     xfer         TIMESTAMPTZ,                            -- as stamped locally
     origin       VARCHAR(8)   NOT NULL DEFAULT 'real',
     src_host     VARCHAR(64),
@@ -56,23 +58,20 @@ CREATE TABLE IF NOT EXISTS experimental_data (
 );
 
 CREATE TABLE IF NOT EXISTS environment (
-    digest       CHAR(64)     NOT NULL,                  -- sha256, see note 3
     systemid     VARCHAR(20)  NOT NULL,
-    ts           TIMESTAMPTZ,
-    data         TEXT,
+    ts           TIMESTAMPTZ  NOT NULL,
+    data         JSON,
     xfer         TIMESTAMPTZ,
     origin       VARCHAR(8)   NOT NULL DEFAULT 'real',
     src_host     VARCHAR(64),
     ingested_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    PRIMARY KEY (digest),
+    PRIMARY KEY (systemid, ts),                          -- see note 3
     CONSTRAINT environment_origin_ck CHECK (origin IN ('real', 'fake'))
 );
 
 -- Query patterns the API will use: "give me run N", "give me environment
--- between two instants". Both are range scans.
-CREATE INDEX IF NOT EXISTS idx_expdata_run      ON experimental_data (systemid, run, row_no);
+-- between two instants". Both are range scans; served by their primary keys.
 CREATE INDEX IF NOT EXISTS idx_expdata_ts       ON experimental_data (ts);
-CREATE INDEX IF NOT EXISTS idx_env_system_ts    ON environment (systemid, ts);
 
 -- Transfer audit log. One row per batch the service commits remotely; this is
 -- what you point at when someone asks "did last Tuesday's run make it across?"
