@@ -1,0 +1,18 @@
+# API only, using the EXISTING PostgreSQL archive. No database is created/reset.
+name: kat-gateway-live
+services:
+  gateway:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "katgateway.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--root-path", "/csit321", "--no-access-log"]
+    environment:
+      KAT_PG_HOST: ${KAT_PG_HOST:?Set the PostgreSQL server address}
+      KAT_PG_PORT: ${KAT_PG_PORT:-5432}
+      KAT_PG_DATABASE: ${KAT_PG_DATABASE:?Set the archive database}
+      KAT_PG_USER: ${KAT_PG_USER:?Set the API database role}
+      KAT_PG_PASSWORD: ${KAT_PG_PASSWORD:?Set the API database password}
+      KAT_PG_SSLMODE: ${KAT_PG_SSLMODE:-require}
+      KAT_API_WRITE_TOKEN: ${KAT_API_WRITE_TOKEN:?Set a write token}
+      KAT_API_READ_TOKEN: ${KAT_API_READ_TOKEN:?Set a read token}
+    ports:
+      - "127.0.0.1:8001:8000"

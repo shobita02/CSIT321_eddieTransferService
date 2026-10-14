@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import socket
 import tomllib
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,16 +45,26 @@ class ZmqConfig:
 
 @dataclass
 class RemoteConfig:
-    """Where rows are shipped to."""
+    """HTTP gateway connection. The laptop has no database credentials."""
 
-    # PostgreSQL: the local Docker container, or the Bored Owl dev server.
-    host: str = "192.168.40.100"
-    port: int = 5432
-    database: str = "csit321"
-    user: str = ""
-    password: str = ""
-    sslmode: str = "prefer"
-    connect_timeout_s: int = 10
+    url: str = "http://127.0.0.1:8080"
+    token: str = field(default="", repr=False)
+    timeout_s: float = 30.0
+    ca_file: str | None = None
+
+    def __post_init__(self) -> None:
+        self.url = self.url.rstrip("/")
+        parsed = urlsplit(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("remote.url must be an HTTP or HTTPS gateway URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("remote.url cannot contain credentials, a query or fragment")
+        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Use HTTPS for a gateway outside this machine")
+        if not self.token or "${" in self.token:
+            raise ValueError("Set KAT_API_WRITE_TOKEN before loading the client config")
+        if self.timeout_s <= 0:
+            raise ValueError("remote.timeout_s must be positive")
 
 
 @dataclass
@@ -106,21 +117,22 @@ def load(path: str | Path | None = None) -> ServiceConfig:
         batch_size=int(local_raw.get("batch_size", 500)),
         busy_timeout_s=float(local_raw.get("busy_timeout_s", 10.0)),
     )
+    if not 1 <= local.batch_size <= 1000:
+        raise ValueError("local.batch_size must be between 1 and 1000")
 
     remote_raw = dict(raw.get("remote", {}))
-    if remote_raw.get("kind", "postgres") != "postgres":
+    if remote_raw.get("kind", "gateway") != "gateway" or any(
+        key in remote_raw for key in ("host", "port", "database", "user", "password", "sslmode")
+    ):
         raise ValueError(
-            f"remote.kind = {remote_raw['kind']!r} is no longer supported; the "
-            "SQLite mock remote was removed. Use PostgreSQL (docker compose up -d)."
+            "Direct PostgreSQL client configs are no longer supported. Use "
+            "[remote] kind = 'gateway', url and token; database credentials belong on the server."
         )
     remote = RemoteConfig(
-        host=_expand(remote_raw.get("host", "192.168.40.100")),
-        port=int(remote_raw.get("port", 5432)),
-        database=_expand(remote_raw.get("database", "csit321")),
-        user=_expand(remote_raw.get("user", "")),
-        password=_expand(remote_raw.get("password", "")),
-        sslmode=remote_raw.get("sslmode", "prefer"),
-        connect_timeout_s=int(remote_raw.get("connect_timeout_s", 10)),
+        url=_expand(remote_raw.get("url", "http://127.0.0.1:8080")),
+        token=_expand(remote_raw.get("token", "${KAT_API_WRITE_TOKEN}")),
+        timeout_s=float(remote_raw.get("timeout_s", 30)),
+        ca_file=str(resolve(remote_raw["ca_file"])) if remote_raw.get("ca_file") else None,
     )
 
     zmq_raw = raw.get("zmq", {})

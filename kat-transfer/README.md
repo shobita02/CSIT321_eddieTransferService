@@ -1,213 +1,189 @@
-# kat-transfer
+# KAT transfer client, gateway and API
 
-The **CSIT321 Transfer Client**. It reads new rows from the KAT SQLite database
-on a laptop and sends them to the PostgreSQL archive on the Bored Owl dev
-server (`192.168.40.100`).
+KAT keeps recording into its existing SQLite database. The transfer client sends
+pending records to an authenticated HTTP API behind NGINX. Only the API server
+connects to PostgreSQL; laptops and researchers need no PostgreSQL credentials.
 
-```
-KAT  ──► KAT SQLite DB (~/katdata.db) ──► kat-transfer ──► PostgreSQL archive
-                                                           (192.168.40.100)
-```
-
-## How the transfer works
-
-KAT's tables already have an `xfer` column. A row with `xfer IS NULL` has not
-been sent yet. That column is the only state the service keeps.
-
-```
-1. read a batch of rows WHERE xfer IS NULL          (ExperimentalData, Environment)
-2. send the parent Experiment rows for that batch   (so the foreign key is satisfied)
-3. upsert the batch into PostgreSQL and commit
-4. only then set xfer = now() on those rows in KAT's database
-5. repeat until nothing is pending
+```mermaid
+flowchart LR
+    KAT[KAT] --> SQLite[(Local SQLite)]
+    SQLite --> Client[Transfer client]
+    Client -->|HTTPS + upload token| NGINX[NGINX gateway]
+    NGINX --> API[CSIT321 API]
+    API --> PostgreSQL[(PostgreSQL archive)]
+    Researcher[Researcher / Python / future UI] -->|HTTPS + read token| NGINX
+    KAT -. ZeroMQ notification .-> Client
 ```
 
-What this gives you:
+## Try the local demonstration
 
-- **Nothing is missed.** The service asks the database what is pending, so it
-  doesn't matter whether it was running when KAT wrote the data.
-- **Nothing is duplicated.** Every remote write is an upsert on a primary key
-  (see below), so sending a row twice just updates it.
-- **Nothing is lost on a crash.** `xfer` is stamped only *after* the remote
-  commits. A crash in between means the rows are sent again, never skipped.
-- **A failed write is retried.** If the server is down or rejects a batch, the
-  rows keep `xfer = NULL` and go in the next attempt.
-
-The only thing the service writes to KAT's database is `xfer`. The KAT schema
-remains exactly the same as provided (`schema/kat_sqlite.sql`).
-
-## The remote tables and their primary keys
-
-Defined in `schema/remote_postgres.sql`.
-
-| Remote table | Comes from (KAT) | Primary key | Notes |
-|---|---|---|---|
-| `experiment` | `Experiment` | `(systemid, run)` | Same as KAT's `UNIQUE (systemid, run)` |
-| `experimental_data` | `ExperimentalData` | `(systemid, run, row_no)` | KAT's `row` is renamed `row_no`. Foreign key to `experiment` |
-| `environment` | `Environment` | `(systemid, ts)` | **Added by us**, see below |
-| `transfer_log` | — | `id` | One row per batch sent: when, how many, success or failure |
-
-- **`environment` key.** KAT's `Environment` table has no unique constraint, so
-  the archive keys it on the timestamp plus `systemid` (several rigs send to
-  one archive, and two rigs can sample at the same instant). Samples with the
-  same data at different times are always kept as separate rows. If KAT ever
-  writes two rows for the same rig at the same instant, the later one is kept.
-- **`data` is `json`** in `experimental_data` and `environment`. Plain `json`
-  (not `jsonb`) stores the text exactly as KAT wrote it. A payload that isn't
-  valid JSON is rejected by PostgreSQL and its row stays unsent.
-- **Extra columns** on every data table: `xfer` (when it was sent), `origin`
-  (`real` or `fake`), `src_host` (which laptop sent it) and `ingested_at`.
-
-## Install
-
-Install the requirements into a virtual environment (venv). It keeps this
-project's packages separate from everything else on your machine and and server avoids
-the "installed but `No module named ...`" problem you get when a laptop has
-more than one Python.
-
-**First time only,** from the `kat-transfer` folder:
+Use Python 3.12+ and Docker Desktop with its Linux engine running. Record some
+data with KAT first so `~/katdata.db` exists. From this
+`kat-transfer` folder, create and activate a Python environment if you do not
+already have one:
 
 ```powershell
-python -m venv .venv                          # create the venv (macOS/Linux: python3)
-.venv\Scripts\Activate.ps1                    # activate it (macOS/Linux: source .venv/bin/activate)
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-**Every new terminal:** activate it again before running anything:
-
-```powershell
+python -m venv .venv
 .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python tools/demo.py
 ```
 
-You'll see `(.venv)` at the start of the prompt when it's active. Type
-`deactivate` to leave it.
+The demo generates an ignored `.env` file containing two separate random tokens
+if needed, starts local PostgreSQL, the API and NGINX, and transfers all pending
+measurement and environment rows from `~/katdata.db`. It compares the archived
+JSON text with SQLite. Record counts depend on the data recorded with KAT.
+Successful uploads update the original KAT database's `xfer` stamps.
 
-- **`running scripts is disabled on this system`** when activating in
-  PowerShell: run
-  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, then activate
-  again. In Command Prompt use `.venv\Scripts\activate.bat` instead.
-- **VS Code:** press Ctrl+Shift+P, choose *Python: Select Interpreter*, then
-  pick `.venv`. New terminals then activate it automatically.
-- `.venv` is in `.gitignore`, so it's never committed. Everyone creates their
-  own.
-- Always use `python -m pip`, not bare `pip`, so packages go into the Python
-  that runs the service.
+Open [API documentation](http://127.0.0.1:8080/docs). To try data endpoints,
+click **Authorize** and paste the read token from your local `.env` file.
+The write token can also read, but only the write token can upload.
 
+The demo uses the existing KAT database at `~/katdata.db` and the local gateway
+at `http://127.0.0.1:8080`. If no rows are pending, it exits with an
+already-transferred message. The `origin` defaults to `fake` for development;
+choose an appropriate origin for data intended to be retained as real measurements.
 
-## 
-## Run it locally (Docker, no VPN) (Database resets and cleans at the start of each container so easier to start from scratch)
+For a deliberate local replay, `python tools/demo.py --resend` first creates a
+timestamped `katdata.backup-YYYYMMDD-HHMMSS.db` beside the source, then clears its
+measurement and environment `xfer` stamps and resends all rows. These stamps
+are shared by clients using that source database: a local demo upload does not
+mean that the office archive has received the same records.
 
-`config.toml` sends to a PostgreSQL container on your own machine, built from
-the same schema. Useful for testing and as a backup demo.
+## Run the transfer client separately
+
+Set the upload token for the current terminal. For the local demo, this reads
+only its generated token without printing it:
 
 ```powershell
-docker compose up -d                          # start the local archive
-python tools/make_fake_db.py --reset          # optional: build a fake KAT database or you can generate fake data through KAT
+$env:KAT_API_WRITE_TOKEN = (Get-Content .env | Where-Object { $_ -like 'KAT_API_WRITE_TOKEN=*' }) -replace '^KAT_API_WRITE_TOKEN=', ''
+python -m katxfer.service --doctor
 python -m katxfer.service --status
 python -m katxfer.service --once
 python tools/verify_transfer.py
-python tools/show_state.py                    # print both databases side by side
+python tools/show_state.py --limit 5
 ```
 
-`config.toml` reads the real `~/katdata.db`. To use the fake source database instead,
-set `path = "data/kat.sqlite"` under `[local]`.
+Leave out `--once` to keep the client running. Its startup catch-up and periodic
+sweep still find unsent rows even if ZeroMQ notifications are absent or lost.
+The existing ZeroMQ implementation is retained; see [its notes](docs/zeromq.md).
+After a successful transfer, a second service `--once` run sends zero rows.
 
-- **Start the archive again from empty:** `docker compose down -v`, then
-  `docker compose up -d`. Do this after any change to `remote_postgres.sql`.
-- **Look at the archive directly:** `docker exec -it kat-remote-pg psql -U kat -d csit321`
-- **Make every KAT row unsent again:**
-  `UPDATE ExperimentalData SET xfer = NULL; UPDATE Environment SET xfer = NULL;`
-  It's safe, because the remote upserts. 
+`config.toml` reads `~/katdata.db` and targets the local NGINX gateway.
+`config.tunnel.toml` targets the office API through the temporary SSH tunnel;
+`config.live.toml` targets the administrator's final HTTPS route.
+`config.example.toml` is a copyable template for another laptop.
+Client `[remote]` now contains only `kind = "gateway"`, URL, token, timeout and
+an optional `ca_file` for a private certificate authority. Old direct database
+configs fail with a migration message. Remote HTTP is allowed only for loopback;
+use trusted HTTPS for a remote server.
 
-## Run it against the live PostgreSQL server (config.live.toml file)
+## What protects the transfer
 
-You need the VPN connected.
+1. The client reads a batch where `xfer IS NULL` and uploads its parent experiments.
+2. The API authenticates and validates each table batch before executing SQL.
+3. Data upserts and the measurement/environment audit record commit in one
+   PostgreSQL transaction. The response confirms `committed`, `sent` and `applied`.
+4. Only a complete successful acknowledgement allows SQLite's `xfer` to be set.
+5. Timeouts, rejected requests and incomplete acknowledgements leave rows pending.
+   A lost reply after commit causes a safe resend on the existing primary keys.
 
-**1. [DONE] [You can drop and rebuild everything if you want to, just set katdata.db back to original to reset if you want real type of data] Create the tables (once).** In pgAdmin, connect to the server, open the
-Query Tool on the archive database, open `schema/remote_postgres.sql` and run
-it. Or with `psql`:
+The original schema and identity rules are retained. Measurement identity is
+`(systemid, run, row_no)`; environment identity is `(systemid, timestamp)`.
+Repeated environment keys keep the last sample, as in the existing archive.
+JSON remains text inside the HTTP payload and is stored as PostgreSQL `json`,
+so formatting survives the transfer. KAT epoch-millisecond timestamps are
+converted to timezone-aware ISO 8601. Each table batch is atomic; the parent,
+measurement and environment requests are separate transactions.
+
+## Read data through the API
+
+All data endpoints require `Authorization: Bearer <token>`.
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/health` | Process health, no archive data |
+| GET | `/v1/status` | Archive counts and database availability |
+| POST | `/v1/ingest/experiments` | Upsert parent experiment rows |
+| POST | `/v1/ingest/experimental-data` | Upsert measurement rows and audit |
+| POST | `/v1/ingest/environment` | Upsert environment rows and audit |
+| GET | `/v1/experiments` | List experiments; filter by systemid or origin |
+| GET | `/v1/experiments/{systemid}/{run}` | Retrieve one experiment |
+| GET | `/v1/experimental-data` | Read measurements; filter by systemid, run or origin |
+| GET | `/v1/environment` | Read environment; filter by systemid, origin, from_ts or to_ts |
+| GET | `/v1/transfers` | Read successful transfer audit records |
+| GET | `/docs`, `/openapi.json` | Interactive documentation and API contract |
+
+List endpoints return `{ "items": [...], "limit": 100, "offset": 0 }` in a stable
+key order. Use `limit` from 1 to 1000 and a nonnegative `offset`. Timestamps use
+ISO 8601 with a timezone; environment ranges are inclusive. The `data` field is
+the original JSON string, or SQL null. Schema details and example requests are
+in [the API guide](docs/gateway-api.md).
+
+Replace the example system ID and run number below with values recorded by KAT:
 
 ```powershell
-psql -h 192.168.40.100 -U <your_role> -d <database> -f schema/remote_postgres.sql
+$env:KAT_API_READ_TOKEN = (Get-Content .env | Where-Object { $_ -like 'KAT_API_READ_TOKEN=*' }) -replace '^KAT_API_READ_TOKEN=', ''
+python tools/read_run.py --systemid K4-RIG-01 --run 1 --csv run1.csv
 ```
-
-**2. Set your login for this terminal.** `config.live.toml` reads these from
-the environment, so no password is ever saved in a file:
-
-```powershell
-$env:KAT_PG_DATABASE = "<database>"
-$env:KAT_PG_USER     = "<your_role>"
-$env:KAT_PG_PASSWORD = "<password>"
-```
-
-These last only for this PowerShell window. If one isn't set, the login fails
-with what looks like a wrong password.
-
-**3. Run the transfer:**
-
-```powershell
-python -m katxfer.service -c config.live.toml --doctor        # check setup and resolved config
-python -m katxfer.service -c config.live.toml --status        # pending locally vs rows on the server
-python -m katxfer.service -c config.live.toml --once          # send everything pending, then exit
-python -m katxfer.service -c config.live.toml --status        # pending should now be 0
-python tools/verify_transfer.py -c config.live.toml           # row-by-row check: nothing missing or changed
-```
-
-To keep it running and sending new rows as KAT writes them, leave out `--once`:
-
-```powershell
-python -m katxfer.service -c config.live.toml
-```
-
-Before sending real KAT data, set `origin = "real"` under `[service]` in
-`config.live.toml`, so the archive doesn't label it `fake`.
-
-
-
-## If something goes wrong
-
-Run `python -m katxfer.service --doctor` first (add `-c config.live.toml` for
-the live server). It shows which Python is running, which packages it can see,
-and the config it loaded.
-
-
-## Configuration
-
-| File | Sends to |
-|---|---|
-| `config.toml` | Local Docker PostgreSQL (`127.0.0.1`, user `kat`) |
-| `config.live.toml` | Live server `192.168.40.100`, login from `$env:KAT_PG_*` |
-
-Any `${VAR}` in a config value is read from the environment. Main settings:
-`[local] path` (KAT's database), `[local] batch_size` (rows per batch),
-`[service] sweep_interval_s` (how often it checks for new rows when left
-running), `[service] origin` (`real` or `fake`).
-
-
-## Still open
-
-1. **0mq notification subscription to be added**
-2. **CSIT321 Gateway and API structure to be built**
 
 ## Tests
 
-The tests send to a real PostgreSQL, so start the Docker container first:
+Install the development dependencies, expose the isolated test database only
+on loopback, and require PostgreSQL rather than accepting skipped checks:
 
 ```powershell
-docker compose up -d
-python -m pytest tests/ -q      # 23 tests
+python -m pip install -r requirements-dev.txt
+python tools/new_demo_env.py     # only if .env does not exist yet
+# The test override publishes PostgreSQL on 127.0.0.1:25432.
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build --wait
+$env:KAT_REQUIRE_PG = '1'
+python -m pytest tests -q
 ```
 
-Each run creates its own `kat_test` database in the container and empties it before every test, so the demo database (`csit321`) is never touched. If PostgreSQL isn't running, the tests that need it are skipped and tell you to start it.
+Tests recreate only `kat_gateway_test`, never the demo or live archive. Default
+test credentials match `tools/new_demo_env.py`. Override `KAT_TEST_PG_HOST`,
+`KAT_TEST_PG_PORT`, `KAT_TEST_PG_USER` and `KAT_TEST_PG_PASSWORD` if needed.
+Without `KAT_REQUIRE_PG=1`, database-dependent tests skip if PostgreSQL is absent.
+The GitHub Actions workflow runs the suite with PostgreSQL required.
 
-## Layout
+## Deploy on the development server
 
-```
-katxfer/          the service: config, localdb (KAT side), sinks (remote side), service (loop + CLI), zmqbus
-tools/            make_fake_db, kat_simulator, show_state, verify_transfer, zmq_listen
-schema/           kat_sqlite.sql (KAT, as provided), remote_postgres.sql (archive)
-config.toml       local Docker archive
-config.live.toml  live server
-tests/
-```
+Follow [the deployment guide](docs/deployment.md). The supplied live URL
+`https://192.168.40.100/csit321` is an integration template, not a claim that this
+route or a matching certificate is already configured. The administrator must
+confirm the HTTPS hostname, certificate and NGINX route. The live compose file
+runs the API against the existing archive and does not create or reset a database.
+
+The setup email provides each teammate a server account with Python 3.12 and no sudo access.
+The guide therefore starts with a native Python venv deployment and supplies
+an administrator service template. Server Docker deployment is optional and
+requires administrator-provided access. The confirmed pgAdmin archive is
+`experimentaldata`, using the development login `csit`. Use the read-only
+[pgAdmin checks](docs/pgadmin-checks.sql) to inspect its schema before uploading.
+
+Build a server-only source archive with `python tools/package_server.py`.
+It packages the current local API changes, verifies their hashes, and excludes
+local credentials, the VPN profile, databases and Python environments. Follow
+the deployment guide to upload it and recreate the venv in the Linux account.
+
+The standard local compose file publishes only NGINX on `127.0.0.1:8080`.
+PostgreSQL is private unless the explicit test override is used. Stop the demo
+with `docker compose down`; its database volume is preserved.
+
+## Files
+
+- `katxfer/`: SQLite transfer loop and HTTP sink
+- `katgateway/`: authentication, validated API models and server-only PostgreSQL access
+- `deploy/`: local and live NGINX configuration
+- `tools/`: demo, fake data, verification, diagnostics and a researcher read example
+- `schema/`: existing KAT and PostgreSQL schemas
+- `tests/`: transfer, API, retry, transaction, access-control and ZeroMQ checks
+- `requirements.txt`: client dependencies; `requirements-server.txt`: server dependencies
+
+This prototype uses one upload token and one read token. Per-user accounts,
+per-rig permissions, token rotation and an approved public-data policy are
+follow-up work for the team. `origin` and `src_host` are client-supplied provenance,
+not verified user identity. Offset pagination is for bounded reads; pause writes
+when producing a fixed verification snapshot. Schema migrations, backups and
+service monitoring remain deployment responsibilities.

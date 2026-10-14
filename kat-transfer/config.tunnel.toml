@@ -1,0 +1,33 @@
+# Transfer client: SQLite -> office server gateway through an SSH tunnel, for
+# testing before the NGINX/HTTPS route exists. Open the tunnel first and keep it open:
+# In Windows PowerShell, use your assigned server username:
+#   $serverUser = Read-Host 'Your assigned server username'
+#   ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8001 "${serverUser}@192.168.40.100"
+# Then: python -m katxfer.service -c config.tunnel.toml --once
+# This writes to the REAL office archive.
+[local]
+path = "~/katdata.db"
+batch_size = 500
+busy_timeout_s = 10.0
+
+[remote]
+kind = "gateway"
+url = "http://127.0.0.1:18080"
+token = "${KAT_API_WRITE_TOKEN}"
+timeout_s = 30
+
+[zmq]
+# Listen for KAT notifications; the sweep still runs if none arrive.
+enabled = true
+endpoint = "tcp://127.0.0.1:5556"
+topics = [""]
+bind = false
+
+[service]
+sweep_interval_s = 10.0
+notify_debounce_s = 0.5
+# Change to "real" only when the selected database contains data to keep.
+origin = "fake"
+retry_base_s = 2.0
+retry_max_s = 60.0
+log_level = "INFO"

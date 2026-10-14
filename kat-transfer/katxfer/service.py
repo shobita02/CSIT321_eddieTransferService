@@ -115,6 +115,7 @@ class TransferService:
             return 0
 
         sink = self._sink_or_connect()
+        sink.begin_batch(started, trigger)
         xfer_at = datetime.now(timezone.utc)
         moved = 0
 
@@ -204,7 +205,7 @@ class TransferService:
         log.info(
             "local=%s remote=%s origin=%s sweep=%.0fs",
             self.cfg.local.path,
-            f"{self.cfg.remote.host}:{self.cfg.remote.port}/{self.cfg.remote.database}",
+            self.cfg.remote.url,
             self.cfg.origin,
             self.cfg.sweep_interval_s,
         )
@@ -317,7 +318,7 @@ class TransferService:
             sink = self._sink_or_connect()
             remote = sink.counts()
             r = self.cfg.remote
-            target = f"{r.host}:{r.port}/{r.database}"
+            target = r.url
             lines.append(f"remote : {target}")
             for table, n in remote.items():
                 lines.append(f"  {table:<24} : {n}")
@@ -350,8 +351,8 @@ def doctor(config_path: Path | None) -> str:
         except ImportError:
             return f"  [MISSING] {package:<16} needed for {needed_for}"
         # Modules disagree about where they keep their version: sqlite3 uses
-        # `sqlite_version` for the engine, psycopg2 appends build flags to
-        # `__version__`. Take the first thing that looks like a version.
+        # `sqlite_version` for the engine, `__version__` for packages.
+        # Take the first thing that looks like a version.
         raw = next(
             (
                 str(getattr(mod, attr))
@@ -363,7 +364,7 @@ def doctor(config_path: Path | None) -> str:
         return f"  [ok]      {package:<16} {raw.split()[0]}"
 
     lines.append(probe("zmq", "pyzmq", "0MQ notifications (optional)"))
-    lines.append(probe("psycopg2", "psycopg2-binary", "the PostgreSQL remote"))
+    lines.append(probe("httpx", "httpx", "the HTTP gateway"))
     lines.append(probe("sqlite3", "sqlite3", "everything (standard library)"))
 
     if any("[MISSING]" in line for line in lines):
@@ -385,8 +386,8 @@ def doctor(config_path: Path | None) -> str:
         f"config     : {config_path or DEFAULT_CONFIG_PATH}",
         f"  local KAT db   : {cfg.local.path}"
         + ("" if cfg.local.path.exists() else "   <-- DOES NOT EXIST"),
-        f"  remote         : {cfg.remote.host}:{cfg.remote.port}/{cfg.remote.database}"
-        f" as {cfg.remote.user or '(no user)'}",
+        f"  remote gateway : {cfg.remote.url}",
+        "  API token      : configured (hidden)",
         f"  0MQ enabled    : {cfg.zmq.enabled}",
         f"  sweep interval : {cfg.sweep_interval_s:.0f}s",
     ]

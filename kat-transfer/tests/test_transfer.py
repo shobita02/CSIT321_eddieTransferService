@@ -28,31 +28,31 @@ from katxfer.service import TransferService
 # -- 1. completeness ---------------------------------------------------------
 
 
-def test_transfers_everything_pending(cfg):
+def test_transfers_everything_pending(cfg, remote):
     assert local_pending(cfg.local.path) == (20, 5)
 
     moved = TransferService(cfg).run_once()
 
     assert moved == 25
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 20
-    assert remote_count(cfg.remote, "environment") == 5
+    assert remote_count(remote, "experimental_data") == 20
+    assert remote_count(remote, "environment") == 5
 
 
-def test_batching_does_not_lose_rows(cfg):
+def test_batching_does_not_lose_rows(cfg, remote):
     # batch_size is 7 against 20+5 rows, so the drain loop must iterate.
     cfg.local.batch_size = 7
     TransferService(cfg).run_once()
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 20
+    assert remote_count(remote, "experimental_data") == 20
 
 
-def test_second_run_transfers_nothing(cfg):
+def test_second_run_transfers_nothing(cfg, remote):
     TransferService(cfg).run_once()
     assert TransferService(cfg).run_once() == 0
 
 
-def test_only_new_rows_move(cfg):
+def test_only_new_rows_move(cfg, remote):
     TransferService(cfg).run_once()
     conn = sqlite3.connect(cfg.local.path)
     conn.execute(
@@ -64,13 +64,13 @@ def test_only_new_rows_move(cfg):
     conn.close()
 
     assert TransferService(cfg).run_once() == 1
-    assert remote_count(cfg.remote, "experimental_data") == 21
+    assert remote_count(remote, "experimental_data") == 21
 
 
 # -- 2. idempotence ----------------------------------------------------------
 
 
-def test_resend_after_crash_does_not_duplicate(cfg):
+def test_resend_after_crash_does_not_duplicate(cfg, remote):
     """The dangerous window: remote committed, then we died before stamping."""
     TransferService(cfg).run_once()
     conn = sqlite3.connect(cfg.local.path)
@@ -82,11 +82,11 @@ def test_resend_after_crash_does_not_duplicate(cfg):
     moved = TransferService(cfg).run_once()
 
     assert moved == 25  # it really did re-send
-    assert remote_count(cfg.remote, "experimental_data") == 20  # no dupes
-    assert remote_count(cfg.remote, "environment") == 5
+    assert remote_count(remote, "experimental_data") == 20  # no dupes
+    assert remote_count(remote, "environment") == 5
 
 
-def test_identical_environment_samples_do_not_collapse(cfg):
+def test_identical_environment_samples_do_not_collapse(cfg, remote):
     """Identity is (systemid, timestamp), never the content.
 
     A quiet sensor reporting the same reading at two instants is two samples,
@@ -104,10 +104,10 @@ def test_identical_environment_samples_do_not_collapse(cfg):
     TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "environment") == 6  # both kept
+    assert remote_count(remote, "environment") == 6  # both kept
 
 
-def test_repeated_environment_key_in_kat_does_not_wedge(cfg):
+def test_repeated_environment_key_in_kat_does_not_wedge(cfg, remote):
     """KAT's Environment has no unique constraint, so it can hold two rows for
     the same system and instant. The remote key holds one; the later wins,
     both are stamped, and the service does not get stuck retrying the batch."""
@@ -123,14 +123,14 @@ def test_repeated_environment_key_in_kat_does_not_wedge(cfg):
     TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "environment") == 5
+    assert remote_count(remote, "environment") == 5
     data = remote_query(
-        cfg.remote, "SELECT data::text FROM environment ORDER BY ts LIMIT 1"
+        remote, "SELECT data::text FROM environment ORDER BY ts LIMIT 1"
     )[0][0]
     assert data == '{"later": true}'
 
 
-def test_two_rigs_same_instant_both_kept(cfg, tmp_path):
+def test_two_rigs_same_instant_both_kept(cfg, remote, tmp_path):
     """Two laptops can sample at the same instant. The archive key includes
     systemid, so neither overwrites the other."""
     TransferService(cfg).run_once()
@@ -153,10 +153,10 @@ def test_two_rigs_same_instant_both_kept(cfg, tmp_path):
         cfg, local=dataclasses.replace(cfg.local, path=other)
     )
     assert TransferService(other_cfg).run_once() == 1
-    assert remote_count(cfg.remote, "environment") == 6
+    assert remote_count(remote, "environment") == 6
 
 
-def test_invalid_json_rejected_and_left_unstamped(cfg):
+def test_invalid_json_rejected_and_left_unstamped(cfg, remote):
     """The remote `data` column is json. A payload that is not JSON must fail
     the write, and a failed write must never be stamped locally."""
     TransferService(cfg).run_once()
@@ -168,19 +168,19 @@ def test_invalid_json_rejected_and_left_unstamped(cfg):
     conn.commit()
     conn.close()
 
-    import psycopg2
+    from katxfer.sinks import GatewayError
 
-    with pytest.raises(psycopg2.DataError):  # invalid input syntax for type json
+    with pytest.raises(GatewayError):  # invalid input syntax for type json
         TransferService(cfg).run_once()
 
     assert local_pending(cfg.local.path) == (0, 1)  # still waiting
-    assert remote_count(cfg.remote, "environment") == 5
+    assert remote_count(remote, "environment") == 5
 
 
 # -- 3. referential integrity ------------------------------------------------
 
 
-def test_experiment_parents_arrive_first(cfg):
+def test_experiment_parents_arrive_first(cfg, remote):
     """The remote has a FK from experimental_data to experiment.
 
     Experiment has no xfer column, so there is no watermark to follow; the
@@ -188,10 +188,10 @@ def test_experiment_parents_arrive_first(cfg):
     the foreign key, so getting this wrong raises instead of passing quietly.
     """
     TransferService(cfg).run_once()
-    assert remote_count(cfg.remote, "experiment") == 2
+    assert remote_count(remote, "experiment") == 2
 
     orphans = remote_query(
-        cfg.remote,
+        remote,
         "SELECT COUNT(*) FROM experimental_data d "
         "LEFT JOIN experiment e ON e.systemid = d.systemid AND e.run = d.run "
         "WHERE e.systemid IS NULL",
@@ -202,14 +202,19 @@ def test_experiment_parents_arrive_first(cfg):
 # -- 4. ordering and provenance ----------------------------------------------
 
 
-def test_nothing_is_stamped_when_the_remote_fails(cfg, monkeypatch):
+def test_nothing_is_stamped_when_the_remote_fails(cfg, remote, monkeypatch):
     """If the remote write raises, local rows must stay NULL and be retried."""
-    from katxfer import sinks
+    from katgateway.storage import ArchiveStore
+    import psycopg2
 
-    def boom(self, rows, xfer):
-        raise RuntimeError("remote is down")
+    original = ArchiveStore.write_batch
 
-    monkeypatch.setattr(sinks.PostgresSink, "upsert_experimental", boom)
+    def boom(self, table, batch):
+        if table == "experimental_data":
+            raise psycopg2.OperationalError("remote is down")
+        return original(self, table, batch)
+
+    monkeypatch.setattr(ArchiveStore, "write_batch", boom)
 
     svc = TransferService(cfg)
     try:
@@ -221,19 +226,19 @@ def test_nothing_is_stamped_when_the_remote_fails(cfg, monkeypatch):
     assert pending_exp == 20  # nothing stamped, nothing lost
 
 
-def test_rows_are_tagged_with_origin_and_host(cfg):
+def test_rows_are_tagged_with_origin_and_host(cfg, remote):
     TransferService(cfg).run_once()
     origin, host = remote_query(
-        cfg.remote, "SELECT origin, src_host FROM experimental_data LIMIT 1"
+        remote, "SELECT origin, src_host FROM experimental_data LIMIT 1"
     )[0]
     assert origin == "fake"  # so the archive can separate test data from real
     assert host == "testhost"
 
 
-def test_transfer_log_records_each_batch(cfg):
+def test_transfer_log_records_each_batch(cfg, remote):
     TransferService(cfg).run_once()
     rows = remote_query(
-        cfg.remote, "SELECT table_name, rows_sent, trigger, ok FROM transfer_log"
+        remote, "SELECT table_name, rows_sent, trigger, ok FROM transfer_log"
     )
     assert rows, "every committed batch should be auditable"
     assert all(ok is True for *_, ok in rows)
@@ -264,7 +269,7 @@ def test_service_starts_without_pyzmq():
     )
 
 
-def test_doctor_reports_interpreter_and_dependencies(capsys, cfg, tmp_path):
+def test_doctor_reports_interpreter_and_dependencies(capsys, tmp_path):
     """`--doctor` has to work even when things are broken, so it must not
     depend on the config loading successfully."""
     from katxfer.service import main
@@ -274,7 +279,7 @@ def test_doctor_reports_interpreter_and_dependencies(capsys, cfg, tmp_path):
 
     assert sys.executable in out  # the whole point: which Python is this?
     assert "pyzmq" in out
-    assert "psycopg2" in out
+    assert "httpx" in out
     assert "FAILED" in out  # it reported the bad config instead of crashing
 
 
@@ -306,7 +311,7 @@ def test_environment_key_is_system_and_timestamp(kat_db):
     assert len({r.key for r in rows}) == len(rows)
 
 
-def test_kat_epoch_millisecond_timestamps(cfg):
+def test_kat_epoch_millisecond_timestamps(cfg, remote):
     """KAT 1.0.3 stores TIMESTAMP columns as epoch milliseconds, not text.
 
     Taken from a real katdata.db produced by `ed-insert` / `env-record`.
@@ -336,6 +341,6 @@ def test_kat_epoch_millisecond_timestamps(cfg):
 
     assert TransferService(cfg).run_once() == 27
     ts = remote_query(
-        cfg.remote, "SELECT ts FROM experimental_data WHERE systemid = 'CSIT321FAKE'"
+        remote, "SELECT ts FROM experimental_data WHERE systemid = 'CSIT321FAKE'"
     )[0][0]
     assert ts == parse_ts(1790898246165)  # stored as a real timestamptz

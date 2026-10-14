@@ -1,0 +1,21 @@
+# Administrator template. Replace every TEAM_USER with the selected server username.
+# Use the actual absolute checkout path if the home directory differs.
+# Create .env.live.json with the launcher as that user; keep it private to that account.
+[Unit]
+Description=CSIT321 KAT gateway and API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=TEAM_USER
+WorkingDirectory=/home/TEAM_USER/csit321-gateway/kat-transfer
+ExecStart=/home/TEAM_USER/csit321-gateway/kat-transfer/.venv/bin/python -m katgateway --settings /home/TEAM_USER/csit321-gateway/kat-transfer/.env.live.json --port 8001 --root-path /csit321
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

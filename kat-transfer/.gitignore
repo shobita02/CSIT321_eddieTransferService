@@ -8,9 +8,14 @@ data/*.sqlite-shm
 # is tracked because it holds ${VAR} placeholders rather than secrets; if you
 # ever put a real password in it, un-track it immediately.
 .env
+.env.*
+!.env.example
+*.csv
 
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-work*/
 .venv/
 venv/
+output/

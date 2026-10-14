@@ -12,6 +12,7 @@ import sqlite3
 import time
 
 import pytest
+import zmq
 
 from conftest import local_pending, remote_count, remote_query
 
@@ -24,13 +25,17 @@ from katxfer.zmqbus import (
     Subscriber,
 )
 
-ENDPOINT = "tcp://127.0.0.1:55571"
+def new_publisher():
+    # Fixed high ports can be occupied or reserved by Windows/Docker.
+    pub = Publisher("tcp://127.0.0.1:*")
+    endpoint = pub._sock.getsockopt_string(zmq.LAST_ENDPOINT)
+    return pub, endpoint
 
 
 @pytest.fixture()
 def pubsub():
-    pub = Publisher(ENDPOINT.replace("127.0.0.1", "*"))
-    sub = Subscriber(ENDPOINT, topics=[""])
+    pub, endpoint = new_publisher()
+    sub = Subscriber(endpoint, topics=[""])
     time.sleep(0.3)  # let the subscription handshake finish (slow joiner)
     yield pub, sub
     sub.close()
@@ -63,8 +68,8 @@ def test_notification_round_trip(pubsub):
 
 def test_topic_filtering_is_a_prefix_match():
     """SUB filters on a byte prefix, which is why topics are dotted strings."""
-    pub = Publisher("tcp://*:55572")
-    sub = Subscriber("tcp://127.0.0.1:55572", topics=[TOPIC_ENVIRONMENT])
+    pub, endpoint = new_publisher()
+    sub = Subscriber(endpoint, topics=[TOPIC_ENVIRONMENT])
     time.sleep(0.3)
     try:
         pub.send(TOPIC_EXPERIMENTAL, {"ignored": True})
@@ -95,10 +100,10 @@ def test_notifications_sent_before_subscribing_are_lost():
     This is why the service cannot treat a notification as a delivery
     guarantee, and why `sweep_interval_s` exists.
     """
-    pub = Publisher("tcp://*:55573")
+    pub, endpoint = new_publisher()
     pub.send(TOPIC_EXPERIMENTAL, {"sent": "before anyone was listening"})
 
-    sub = Subscriber("tcp://127.0.0.1:55573", topics=[""])
+    sub = Subscriber(endpoint, topics=[""])
     time.sleep(0.3)
     try:
         assert drain(sub, timeout_s=0.5) == []
@@ -107,14 +112,14 @@ def test_notifications_sent_before_subscribing_are_lost():
         pub.close()
 
 
-def test_notifications_lost_while_away_are_still_transferred(cfg):
+def test_notifications_lost_while_away_are_still_transferred(cfg, remote):
     """The property that makes losing notifications survivable.
 
     Rows are written with no subscriber connected, so every notification about
     them is gone. The service still finds them, because it asks the database
     what is pending rather than trusting the message stream.
     """
-    pub = Publisher("tcp://*:55574")
+    pub, _ = new_publisher()
     conn = sqlite3.connect(cfg.local.path)
     conn.execute(
         'INSERT INTO ExperimentalData (systemid, run, "row", timestamp, source, '
@@ -130,10 +135,10 @@ def test_notifications_lost_while_away_are_still_transferred(cfg):
 
     assert moved == 26
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 21
+    assert remote_count(remote, "experimental_data") == 21
 
 
-def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
+def _run_with_fake_subscriber(cfg, remote, monkeypatch, *, notify):
     """Keep real transfers, replacing only notification delivery and time."""
     from katxfer import service, zmqbus
 
@@ -163,8 +168,8 @@ def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
 
             # run() has completed its real startup drain before polling.
             assert local_pending(cfg.local.path) == (0, 0)
-            assert remote_count(cfg.remote, "experimental_data") == 20
-            assert remote_count(cfg.remote, "environment") == 5
+            assert remote_count(remote, "experimental_data") == 20
+            assert remote_count(remote, "environment") == 5
             conn = sqlite3.connect(cfg.local.path)
             try:
                 conn.execute(
@@ -202,20 +207,20 @@ def _run_with_fake_subscriber(cfg, monkeypatch, *, notify):
     assert sub.polls == 2
     assert sub.closed
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 21
-    assert remote_count(cfg.remote, "environment") == 6
-    assert remote_count(cfg.remote, "experiment") == 2
+    assert remote_count(remote, "experimental_data") == 21
+    assert remote_count(remote, "environment") == 6
+    assert remote_count(remote, "experiment") == 2
 
     return remote_query(
-        cfg.remote,
+        remote,
         "SELECT table_name, rows_sent, trigger, ok FROM transfer_log "
         "WHERE trigger != 'startup'",
     )
 
 
-def test_run_transfers_on_zmq_notification(cfg, monkeypatch):
+def test_run_transfers_on_zmq_notification(cfg, remote, monkeypatch):
     """A notification transfers post-startup rows through the running service."""
-    rows = _run_with_fake_subscriber(cfg, monkeypatch, notify=True)
+    rows = _run_with_fake_subscriber(cfg, remote, monkeypatch, notify=True)
 
     assert sorted(rows) == [
         ("environment", 1, "zmq", True),
@@ -223,9 +228,9 @@ def test_run_transfers_on_zmq_notification(cfg, monkeypatch):
     ]
 
 
-def test_run_sweep_recovers_without_notification(cfg, monkeypatch):
+def test_run_sweep_recovers_without_notification(cfg, remote, monkeypatch):
     """The periodic sweep recovers post-startup rows with a silent subscriber."""
-    rows = _run_with_fake_subscriber(cfg, monkeypatch, notify=False)
+    rows = _run_with_fake_subscriber(cfg, remote, monkeypatch, notify=False)
 
     assert sorted(rows) == [
         ("environment", 1, "sweep", True),
@@ -233,7 +238,7 @@ def test_run_sweep_recovers_without_notification(cfg, monkeypatch):
     ]
 
 
-def test_subscriber_failure_falls_back_to_sweep(cfg, monkeypatch):
+def test_subscriber_failure_falls_back_to_sweep(cfg, remote, monkeypatch):
     """A socket error mid-run drops 0MQ and keeps the service on its sweep."""
     import zmq
 
@@ -292,4 +297,4 @@ def test_subscriber_failure_falls_back_to_sweep(cfg, monkeypatch):
     assert sub.closed
     assert triggers == ["startup", "sweep"]
     assert local_pending(cfg.local.path) == (0, 0)
-    assert remote_count(cfg.remote, "experimental_data") == 21
+    assert remote_count(remote, "experimental_data") == 21
