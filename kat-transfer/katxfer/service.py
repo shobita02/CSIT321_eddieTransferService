@@ -255,9 +255,28 @@ class TransferService:
                 woke_for = None
                 if sub is not None:
                     wait = max(0.0, min(1.0, next_sweep - time.monotonic()))
-                    hits = list(sub.poll(wait))
+                    try:
+                        hits = list(sub.poll(wait))
+                        if hits:
+                            hits.extend(self._coalesce(sub))
+                    except Exception as exc:  # noqa: BLE001 - any socket failure
+                        # Same rule as at startup: 0MQ is an optimisation over
+                        # the sweep, so a broken socket must not stop the
+                        # service. Drop it and carry on with the sweep alone.
+                        log.warning(
+                            "0MQ subscriber failed (%s: %s); continuing on the "
+                            "%.0fs sweep only",
+                            type(exc).__name__,
+                            exc,
+                            self.cfg.sweep_interval_s,
+                        )
+                        try:
+                            sub.close()
+                        except Exception:  # noqa: BLE001 - closing a broken socket
+                            pass
+                        sub = None
+                        hits = []
                     if hits:
-                        hits.extend(self._coalesce(sub))
                         tables = {n.table for n in hits if n.table}
                         log.debug(
                             "woken by %d notification(s) %s", len(hits), sorted(tables)
