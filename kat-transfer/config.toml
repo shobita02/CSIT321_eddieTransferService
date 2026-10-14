@@ -1,7 +1,7 @@
 # Transfer client: SQLite -> authenticated gateway. No PostgreSQL credentials.
 # Live HTTPS URL/certificate must be confirmed with the server administrator.
 [local]
-path = "data/kat.sqlite"
+path = "~/katdata.db"
 batch_size = 500
 busy_timeout_s = 10.0
 

@@ -6,19 +6,18 @@ URL, an upload token and any private CA certificate required for TLS trust.
 
 ## Confirmed development access
 
-The setup email supplies VPN access to `192.168.40.100`, PostgreSQL on port 5432,
-and the shared development database login `csit`. Chris's pgAdmin 4 screenshot
-shows the archive name is `experimentaldata` with no space. `Skywards` is the
+Get VPN access to `192.168.40.100`, PostgreSQL on port 5432,
+and the shared development database login `csit`. archive name is `experimentaldata` with no space. `Skywards` is the
 pgAdmin server label; it is not the database name. The database `boredowl` is the
 maintenance database named in the setup email, not the archive this API targets.
 
-Chris's Linux account is `chrisw`. The email says Python 3.12 is installed and
-the account has no sudo permission. Use a Python virtual environment in the
+Python 3.12 is installed and
+our accounts have no sudo permission. Use a Python virtual environment in the
 account's own directory. Treat Docker on the server as an optional deployment
 path only if the administrator has explicitly provided access to it. Docker on
 the laptop remains the local demonstration environment.
 
-Use Chris's own CHRISW VPN profile. The .ovpn file contains private connection
+Use own  VPN profile. The .ovpn file contains private connection
 material and belongs outside this repository. The setup email's passwords are
 not stored in project files. The API has not been deployed to or changed the
 live server, and the HTTPS hostname and NGINX route are not yet confirmed.
