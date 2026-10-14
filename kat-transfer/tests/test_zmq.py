@@ -231,3 +231,65 @@ def test_run_sweep_recovers_without_notification(cfg, monkeypatch):
         ("environment", 1, "sweep", True),
         ("experimental_data", 1, "sweep", True),
     ]
+
+
+def test_subscriber_failure_falls_back_to_sweep(cfg, monkeypatch):
+    """A socket error mid-run drops 0MQ and keeps the service on its sweep."""
+    import zmq
+
+    from katxfer import service, zmqbus
+
+    cfg.zmq.enabled = True
+    svc = TransferService(cfg)
+
+    class FakeClock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    class BrokenSubscriber:
+        polls = 0
+        closed = False
+
+        def poll(self, timeout_s):
+            self.polls += 1
+            conn = sqlite3.connect(cfg.local.path)
+            try:
+                conn.execute(
+                    'INSERT INTO ExperimentalData (systemid, run, "row", '
+                    'timestamp, source, data, xfer) VALUES (?,?,?,?,?,?,NULL)',
+                    ("K4-RIG-01", 1, 999, "2026-10-01 11:00:00.000",
+                     "ADC-CH0", '{"after": "socket failure"}'),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            raise zmq.ZMQError(zmq.ETERM, "simulated socket failure")
+
+        def close(self):
+            self.closed = True
+
+    triggers = []
+    drain = svc._drain_with_retry
+
+    def record(trigger):
+        triggers.append(trigger)
+        drain(trigger)
+        if trigger == "sweep":
+            svc.stop()
+
+    sub = BrokenSubscriber()
+    monkeypatch.setattr(zmqbus, "Subscriber", lambda *args: sub)
+    monkeypatch.setattr(service, "time", FakeClock())
+    monkeypatch.setattr(svc, "_drain_with_retry", record)
+    svc.run()
+
+    assert sub.polls == 1  # dropped after the failure, never polled again
+    assert sub.closed
+    assert triggers == ["startup", "sweep"]
+    assert local_pending(cfg.local.path) == (0, 0)
+    assert remote_count(cfg.remote, "experimental_data") == 21
