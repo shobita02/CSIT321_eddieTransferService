@@ -1,6 +1,8 @@
 # Transfer client: SQLite -> office server gateway through an SSH tunnel, for
 # testing before the NGINX/HTTPS route exists. Open the tunnel first and keep it open:
-#   ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8001 chrisw@192.168.40.100
+# In Windows PowerShell, use your assigned server username:
+#   $serverUser = Read-Host 'Your assigned server username'
+#   ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8001 "${serverUser}@192.168.40.100"
 # Then: python -m katxfer.service -c config.tunnel.toml --once
 # This writes to the REAL office archive.
 [local]

@@ -11,12 +11,12 @@ import tarfile
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "output" / "kat-gateway-server.tar.gz"
 
-SETUP = """# Prepare the gateway in Chris's server account
+SETUP = """# Prepare the gateway in a team server account
 
 This package contains the API source and administrator templates. It contains
 no credentials, VPN profile, databases or Python environment.
 
-On the Ubuntu server as chrisw, after uploading kat-gateway-server.tar.gz:
+On the Ubuntu server using your assigned account, after uploading kat-gateway-server.tar.gz:
 
 ```bash
 mkdir -p ~/csit321-gateway
@@ -40,12 +40,16 @@ check. Once dependencies are ready, run each launcher command separately:
 ```
 
 Configure prompts for the database password, checks archive counts and writes
-.env.live.json with permissions 600. It creates separate read/write API tokens
+.env.live.json with permissions 600 in the current account's checkout. Each
+account creates its own private settings. It creates separate read/write API tokens
 without printing them. The command above binds only to 127.0.0.1:8001. Leave it
 running for the SSH-tunnel check; the administrator's NGINX route is separate.
+Coordinate the selected account: only one API instance can use port 8001 at a time.
 
-The administrator templates use /home/chrisw/csit321-gateway/kat-transfer;
-adjust them if a different directory is used. The schema file is a reference
+The administrator service template uses TEAM_USER and the path
+/home/TEAM_USER/csit321-gateway/kat-transfer. Replace every TEAM_USER with the
+selected server username and use the actual absolute checkout path if it differs.
+The schema file is a reference
 only: the existing experimentaldata archive already has the expected tables.
 Do not execute schema initialisation SQL as part of this preparation.
 

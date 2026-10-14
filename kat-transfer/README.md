@@ -17,7 +17,8 @@ flowchart LR
 
 ## Try the local demonstration
 
-Use Python 3.12+ and Docker Desktop with its Linux engine running. From this
+Use Python 3.12+ and Docker Desktop with its Linux engine running. Record some
+data with KAT first so `~/katdata.db` exists. From this
 `kat-transfer` folder, create and activate a Python environment if you do not
 already have one:
 
@@ -28,19 +29,26 @@ python -m pip install -r requirements.txt
 python tools/demo.py
 ```
 
-The demo generates an ignored `.env` file containing two separate random tokens,
-starts PostgreSQL, the API and NGINX, and creates a fake SQLite database if it
-does not already exist. The first run sends 400 measurement rows and 20
-environment rows from four experiments, then compares the archived JSON text
-with SQLite. A second run sends zero rows. Existing fake data is reused.
+The demo generates an ignored `.env` file containing two separate random tokens
+if needed, starts local PostgreSQL, the API and NGINX, and transfers all pending
+measurement and environment rows from `~/katdata.db`. It compares the archived
+JSON text with SQLite. Record counts depend on the data recorded with KAT.
+Successful uploads update the original KAT database's `xfer` stamps.
 
 Open [API documentation](http://127.0.0.1:8080/docs). To try data endpoints,
 click **Authorize** and paste the read token from your local `.env` file.
 The write token can also read, but only the write token can upload.
 
-The demo uses `data/kat.sqlite`. To use the real KAT database, edit `[local] path`
-in your selected client configuration to `~/katdata.db` and select an appropriate
-`origin`. The demo helper refuses to run against a real database configuration.
+The demo uses the existing KAT database at `~/katdata.db` and the local gateway
+at `http://127.0.0.1:8080`. If no rows are pending, it exits with an
+already-transferred message. The `origin` defaults to `fake` for development;
+choose an appropriate origin for data intended to be retained as real measurements.
+
+For a deliberate local replay, `python tools/demo.py --resend` first creates a
+timestamped `katdata.backup-YYYYMMDD-HHMMSS.db` beside the source, then clears its
+measurement and environment `xfer` stamps and resends all rows. These stamps
+are shared by clients using that source database: a local demo upload does not
+mean that the office archive has received the same records.
 
 ## Run the transfer client separately
 
@@ -59,9 +67,12 @@ python tools/show_state.py --limit 5
 Leave out `--once` to keep the client running. Its startup catch-up and periodic
 sweep still find unsent rows even if ZeroMQ notifications are absent or lost.
 The existing ZeroMQ implementation is retained; see [its notes](docs/zeromq.md).
+After a successful transfer, a second service `--once` run sends zero rows.
 
-`config.toml` targets the local NGINX gateway. `config.live.toml` is the live
-client template. `config.example.toml` is a copyable template for another laptop.
+`config.toml` reads `~/katdata.db` and targets the local NGINX gateway.
+`config.tunnel.toml` targets the office API through the temporary SSH tunnel;
+`config.live.toml` targets the administrator's final HTTPS route.
+`config.example.toml` is a copyable template for another laptop.
 Client `[remote]` now contains only `kind = "gateway"`, URL, token, timeout and
 an optional `ca_file` for a private certificate authority. Old direct database
 configs fail with a migration message. Remote HTTP is allowed only for loopback;
@@ -109,6 +120,8 @@ ISO 8601 with a timezone; environment ranges are inclusive. The `data` field is
 the original JSON string, or SQL null. Schema details and example requests are
 in [the API guide](docs/gateway-api.md).
 
+Replace the example system ID and run number below with values recorded by KAT:
+
 ```powershell
 $env:KAT_API_READ_TOKEN = (Get-Content .env | Where-Object { $_ -like 'KAT_API_READ_TOKEN=*' }) -replace '^KAT_API_READ_TOKEN=', ''
 python tools/read_run.py --systemid K4-RIG-01 --run 1 --csv run1.csv
@@ -142,7 +155,7 @@ route or a matching certificate is already configured. The administrator must
 confirm the HTTPS hostname, certificate and NGINX route. The live compose file
 runs the API against the existing archive and does not create or reset a database.
 
-The setup email gives `chrisw` a Python 3.12 environment without sudo access.
+The setup email provides each teammate a server account with Python 3.12 and no sudo access.
 The guide therefore starts with a native Python venv deployment and supplies
 an administrator service template. Server Docker deployment is optional and
 requires administrator-provided access. The confirmed pgAdmin archive is

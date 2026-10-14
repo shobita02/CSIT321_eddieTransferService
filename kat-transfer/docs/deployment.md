@@ -6,21 +6,23 @@ URL, an upload token and any private CA certificate required for TLS trust.
 
 ## Confirmed development access
 
-Get VPN access to `192.168.40.100`, PostgreSQL on port 5432,
-and the shared development database login `csit`. archive name is `experimentaldata` with no space. `Skywards` is the
+The setup email supplies VPN access to `192.168.40.100`, PostgreSQL on port 5432,
+and the shared development database login `csit`. The verified archive name is
+`experimentaldata` with no space. `Skywards` is the
 pgAdmin server label; it is not the database name. The database `boredowl` is the
 maintenance database named in the setup email, not the archive this API targets.
 
-Python 3.12 is installed and
-our accounts have no sudo permission. Use a Python virtual environment in the
+Python 3.12 is installed and the team accounts have no sudo permission.
+Use a Python virtual environment in the
 account's own directory. Treat Docker on the server as an optional deployment
 path only if the administrator has explicitly provided access to it. Docker on
 the laptop remains the local demonstration environment.
 
-Use own  VPN profile. The .ovpn file contains private connection
+Each teammate uses their own assigned VPN profile and server login. The .ovpn file contains private connection
 material and belongs outside this repository. The setup email's passwords are
-not stored in project files. The API has not been deployed to or changed the
-live server, and the HTTPS hostname and NGINX route are not yet confirmed.
+not stored in project files. Foreground API reads and a small synthetic upload
+have been verified on the development server through an SSH tunnel. The HTTPS
+hostname, NGINX route and persistent service remain to be configured.
 
 Open `docs/pgadmin-checks.sql` in pgAdmin's Query Tool to confirm the archive's
 tables, column types and keys before uploading data. The queries are read-only.
@@ -37,10 +39,16 @@ data tables, SELECT/INSERT on `transfer_log`, and USAGE/SELECT on its sequence.
 `deploy/grants.example.sql` provides those grants after changing its example role
 name. The API needs no superuser, database-creation or table-deletion permission.
 
-## Native Python setup for the chrisw account
+## Native Python setup for a team account
 
-Connect from the laptop using `ssh chrisw@192.168.40.100`. If the server requires
-the initial account password to be changed, complete that interactively. Keep
+In Windows PowerShell, enter your assigned server username when prompted:
+
+```powershell
+$serverUser = Read-Host 'Your assigned server username'
+ssh "${serverUser}@192.168.40.100"
+```
+
+If the server requires the initial account password to be changed, complete that interactively. Keep
 the chosen password out of project files.
 
 On the laptop, run `tools/package_server.py` to create the current server source
@@ -48,8 +56,15 @@ bundle at `output/kat-gateway-server.tar.gz`. The builder verifies its files and
 excludes passwords, VPN profiles, databases and Python environments. The bundle
 uses the current workspace source, including changes not yet pushed to GitHub.
 
-Copy that archive to the `chrisw` account using SCP in a separate local PowerShell
-window. Then, in the server SSH session:
+Copy that archive to your assigned account using SCP in a separate local PowerShell
+window, from the laptop's `kat-transfer` folder:
+
+```powershell
+$serverUser = Read-Host 'Your assigned server username'
+scp output/kat-gateway-server.tar.gz "${serverUser}@192.168.40.100:kat-gateway-server.tar.gz"
+```
+
+Then, in the server SSH session:
 
 ```bash
 mkdir -p ~/csit321-gateway
@@ -58,8 +73,10 @@ cd ~/csit321-gateway/kat-transfer
 ```
 
 Recreate the Python environment on Linux. The administrator service template
-uses `/home/chrisw/csit321-gateway/kat-transfer`; adjust its paths if another
-directory is chosen. `SOURCE_MANIFEST.json` lists hashes of the packaged files.
+uses `/home/TEAM_USER/csit321-gateway/kat-transfer`. Replace every `TEAM_USER`
+with the selected service account's username, and use the actual absolute
+checkout path reported by `pwd` if its home directory differs. Systemd does
+not expand `~` in these paths. `SOURCE_MANIFEST.json` lists hashes of the packaged files.
 
 On the server, from `~/csit321-gateway/kat-transfer`:
 
@@ -88,7 +105,9 @@ press Enter. The launcher reads it directly through Python's password prompt.
 It first checks archive counts, then creates `.env.live.json` with permissions
 600, containing the database settings and two separate random API tokens.
 Setup and startup do not print passwords or tokens. Setup changes no database
-records and refuses to replace an existing settings file.
+records and refuses to replace an existing settings file. Each account creates
+its own settings with this command; do not copy another account's private
+settings file or tokens into a new account's deployment.
 
 The defaults match the verified server connection: PostgreSQL at 127.0.0.1:5432,
 database `experimentaldata`, user `csit`, SSL mode `prefer`. Override `--pg-host`,
@@ -104,6 +123,8 @@ Check saved settings, then start the process:
 
 The launcher binds the API to server loopback at 127.0.0.1:8001, with no path
 prefix during direct testing. Keep this terminal open. Stop it with Ctrl+C.
+Only one API instance can use port 8001 on this server at a time. Coordinate
+which team account runs it before starting another instance.
 The server's JSON settings file is private and excluded from Git; it must not
 be copied into the repository, deployment package or a public message.
 
@@ -112,7 +133,8 @@ be copied into the repository, deployment package or a public message.
 In a second Windows PowerShell window:
 
 ```powershell
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8001 chrisw@192.168.40.100
+$serverUser = Read-Host 'Your assigned server username'
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18080:127.0.0.1:8001 "${serverUser}@192.168.40.100"
 ```
 
 Leave that connection open. It forwards laptop port 18080 to the API's loopback
@@ -124,10 +146,12 @@ an administrator task. A client configured for the tunnel uses
 
 The launcher can explicitly print one token for an authorised client with
 `--print-token read` or `--print-token write`. For example, copy the read token
-into the Windows clipboard without displaying it in the terminal:
+into the Windows clipboard without displaying it in the terminal. Use the
+account that owns the running API's settings:
 
 ```powershell
-ssh chrisw@192.168.40.100 'cd /home/chrisw/csit321-gateway/kat-transfer && .venv/bin/python -m katgateway --print-token read' | Set-Clipboard
+$serverUser = Read-Host 'Server username that owns the API settings'
+ssh "${serverUser}@192.168.40.100" 'cd ~/csit321-gateway/kat-transfer && .venv/bin/python -m katgateway --print-token read' | Set-Clipboard
 ```
 
 Paste that token into the docs page's Authorize dialog and use `/v1/status` to
@@ -138,7 +162,9 @@ that the administrator's HTTPS route or NGINX integration is configured.
 ## Persistent native service
 
 Give the administrator `deploy/katgateway.service.example` and
-`deploy/nginx.live.conf`. The service template runs under `chrisw`, loads the
+`deploy/nginx.live.conf`. Replace every `TEAM_USER` in the service template
+with the selected service account's username and adjust its absolute paths.
+The service runs under that account, loads the
 private `.env.live.json`, and invokes the venv's Python launcher with
 `--port 8001 --root-path /csit321`. This matches the NGINX location that strips `/csit321/`
 from forwarded request paths. Port 8000 was already occupied during setup; the verified native API uses 8001.
@@ -233,8 +259,9 @@ that exceed the 8 MiB request limit.
 
 ## Handover boundaries
 
-The local demo and test database use a separate compose project and volume. The
-live deployment template has not been executed against BoredOwl. User accounts,
+The local demo archive and test database use a separate compose project and volume.
+The persistent native service and live container templates have not been installed
+on the development server. User accounts,
 per-rig permissions, managed token rotation, database backups, monitoring and
 the final public-read policy need the team's deployment decisions. Shared tokens
 are a prototype access mechanism; `src_host` is a reported source, not a trusted
