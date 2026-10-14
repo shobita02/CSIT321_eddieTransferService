@@ -13,8 +13,8 @@ timeout_s = 30
 # For a private TLS authority, set ca_file = "path/to/boredowl-ca.pem".
 
 [zmq]
-# Enable when the KAT publisher is available; sweeping always remains active.
-enabled = false
+# Listen for KAT notifications; the sweep still runs if none arrive.
+enabled = true
 endpoint = "tcp://127.0.0.1:5556"
 topics = [""]
 bind = false
