@@ -19,3 +19,12 @@ __pycache__/
 .venv/
 venv/
 output/
+# PyInstaller build files
+build/
+build_v2/
+dist/
+dist_v2/
+*.spec
+
+# Local configuration
+config.local.toml
