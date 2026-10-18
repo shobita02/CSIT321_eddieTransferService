@@ -243,7 +243,7 @@ def test_transfer_log_records_each_batch(cfg, remote):
     assert rows, "every committed batch should be auditable"
     assert all(ok is True for *_, ok in rows)
     assert all(trigger == "manual" for *_, trigger, _ in rows)
-    assert sum(sent for _, sent, _, _ in rows) == 25
+    assert sum(sent for table, sent, _, _ in rows if table != "experiment") == 25
 
 
 # -- optional dependencies ---------------------------------------------------

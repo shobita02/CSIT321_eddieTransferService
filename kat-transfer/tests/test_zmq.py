@@ -224,6 +224,7 @@ def test_run_transfers_on_zmq_notification(cfg, remote, monkeypatch):
 
     assert sorted(rows) == [
         ("environment", 1, "zmq", True),
+        ("experiment", 1, "zmq", True),
         ("experimental_data", 1, "zmq", True),
     ]
 
@@ -234,6 +235,7 @@ def test_run_sweep_recovers_without_notification(cfg, remote, monkeypatch):
 
     assert sorted(rows) == [
         ("environment", 1, "sweep", True),
+        ("experiment", 1, "sweep", True),
         ("experimental_data", 1, "sweep", True),
     ]
 
