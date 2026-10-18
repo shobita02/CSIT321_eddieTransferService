@@ -27,17 +27,21 @@ hostname, NGINX route and persistent service remain to be configured.
 Open `docs/pgadmin-checks.sql` in pgAdmin's Query Tool to confirm the archive's
 tables, column types and keys before uploading data. The queries are read-only.
 
-The archive must already contain the four tables in `schema/remote_postgres.sql`.
-Use its existing schema if it is installed. The live compose file does not run
-initialisation SQL. Do not drop or reset the live archive to install this API.
+The archive must already contain the tables in `schema/remote_postgres.sql`.
+Use its existing schema if it is installed. Apply
+`schema/migrations/002_api_tokens.sql` as the archive owner to add per-user
+authorization without reinitialising the live database. The live compose file
+does not run initialization SQL. Do not drop or reset the live archive.
 
-The API can initially use the provided `csit` login on the server for development.
-The laptop transfer client uses only its API token. For a restricted API database
-role, ask the administrator to create a dedicated login and grant it usage on the
-archive schema, SELECT/INSERT/UPDATE on the three
-data tables, SELECT/INSERT on `transfer_log`, and USAGE/SELECT on its sequence.
-`deploy/grants.example.sql` provides those grants after changing its example role
-name. The API needs no superuser, database-creation or table-deletion permission.
+For example, from the project folder, apply the additive migration with
+`psql -h <database-host> -U <archive-owner> -d experimentaldata -f schema/migrations/002_api_tokens.sql`
+before deploying the new gateway.
+
+Use a restricted database role for the API and a separate owner-managed login
+for token/user administration. `deploy/grants.example.sql` shows the required
+permissions: the API can read users/tokens and update only `last_used_at`; it
+cannot create or delete tokens. The issuer login is used only by the CLI, not
+the running gateway.
 
 ## Native Python setup for a team account
 
@@ -103,11 +107,10 @@ Run these commands separately in the server's SSH terminal:
 Wait for the database password prompt, type the `csit` database password, then
 press Enter. The launcher reads it directly through Python's password prompt.
 It first checks archive counts, then creates `.env.live.json` with permissions
-600, containing the database settings and two separate random API tokens.
-Setup and startup do not print passwords or tokens. Setup changes no database
+600 containing only the API database settings. Setup and startup do not print
+passwords or tokens. Setup changes no database
 records and refuses to replace an existing settings file. Each account creates
-its own settings with this command; do not copy another account's private
-settings file or tokens into a new account's deployment.
+its own settings file; do not copy another account's private settings file.
 
 The defaults match the verified server connection: PostgreSQL at 127.0.0.1:5432,
 database `experimentaldata`, user `csit`, SSL mode `prefer`. Override `--pg-host`,
@@ -144,20 +147,23 @@ it is a temporary development connection, and the production route remains
 an administrator task. A client configured for the tunnel uses
 `http://127.0.0.1:18080`, which is allowed because its HTTP endpoint is loopback.
 
-The launcher can explicitly print one token for an authorised client with
-`--print-token read` or `--print-token write`. For example, copy the read token
-into the Windows clipboard without displaying it in the terminal. Use the
-account that owns the running API's settings:
+Create the allow-listed user and issue a token with the separate database-owner
+login. The CLI prompts for its password; the resulting bearer token is printed
+once and is never retrievable later:
 
-```powershell
-$serverUser = Read-Host 'Server username that owns the API settings'
-ssh "${serverUser}@192.168.40.100" 'cd ~/csit321-gateway/kat-transfer && .venv/bin/python -m katgateway --print-token read' | Set-Clipboard
+```bash
+.venv/bin/python -m katgateway --admin-user <issuer_login> user add alice --role write --granted-by <admin_name>
+.venv/bin/python -m katgateway --admin-user <issuer_login> token create --user alice --role write --expires 90d --note "lab laptop"
+.venv/bin/python -m katgateway --admin-user <issuer_login> token list
+.venv/bin/python -m katgateway --admin-user <issuer_login> token revoke <id-or-prefix>
+.venv/bin/python -m katgateway --admin-user <issuer_login> user set-role alice read --granted-by <admin_name>
+.venv/bin/python -m katgateway --admin-user <issuer_login> user disable alice
 ```
 
-Paste that token into the docs page's Authorize dialog and use `/v1/status` to
-check live counts. Give the upload token only to the intended transfer client.
-Do not send either token in a chat screenshot. The tunnel does not establish
-that the administrator's HTTPS route or NGINX integration is configured.
+Token lifetime is capped at 90 days. `user set-role` immediately caps existing
+tokens; `user disable` invalidates them on the next request. Deliver the printed
+token directly and securely to its owner; never put it in screenshots or shared
+configuration.
 
 ## Persistent native service
 
@@ -185,18 +191,15 @@ API's private settings belong only on the server and to the owning account.
 
 If the administrator grants Docker access on the server, use the existing
 `docker-compose.live.yml` with a separate private dotenv file. The native JSON
-profile is not a Docker dotenv file. Prepare `.env.live` with these variable
-names and actual server-only credentials/tokens:
+profile is not a Docker dotenv file. Prepare `.env.live` with these variable names and server-only API database credentials:
 
 ```dotenv
 KAT_PG_HOST=192.168.40.100
 KAT_PG_PORT=5432
 KAT_PG_DATABASE=experimentaldata
-KAT_PG_USER=csit
-KAT_PG_PASSWORD=<database password held only on the server>
+KAT_PG_USER=<restricted gateway login>
+KAT_PG_PASSWORD=<gateway database password held only on the server>
 KAT_PG_SSLMODE=prefer
-KAT_API_WRITE_TOKEN=<upload token>
-KAT_API_READ_TOKEN=<different read token>
 ```
 
 From the full checkout on the Linux server:
@@ -262,8 +265,6 @@ that exceed the 8 MiB request limit.
 The local demo archive and test database use a separate compose project and volume.
 The persistent native service and live container templates have not been installed
 on the development server. User accounts,
-per-rig permissions, managed token rotation, database backups, monitoring and
-the final public-read policy need the team's deployment decisions. Shared tokens
-are a prototype access mechanism; `src_host` is a reported source, not a trusted
-identity. Credentials should be available only to the server and their intended
-API clients. Keep the admin's PostgreSQL login off transfer laptops.
+per-rig permissions, the future user sign-in/issuance app, database backups and
+monitoring remain follow-up work. `src_host` is reported by the client, not a
+trusted identity. Keep the issuer's PostgreSQL login off transfer laptops.

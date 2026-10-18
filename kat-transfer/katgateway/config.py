@@ -18,14 +18,6 @@ class DatabaseConfig:
 @dataclass
 class Settings:
     database: DatabaseConfig
-    write_token: str = field(repr=False)
-    read_token: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if any(len(token) < 32 or "${" in token for token in (self.write_token, self.read_token)):
-            raise ValueError("Set distinct KAT_API_WRITE_TOKEN and KAT_API_READ_TOKEN (at least 32 characters)")
-        if self.write_token == self.read_token:
-            raise ValueError("Read and write tokens must be different")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,6 +35,4 @@ class Settings:
                 password=required("KAT_PG_PASSWORD"),
                 sslmode=os.environ.get("KAT_PG_SSLMODE", "prefer"),
             ),
-            write_token=required("KAT_API_WRITE_TOKEN"),
-            read_token=required("KAT_API_READ_TOKEN"),
         )

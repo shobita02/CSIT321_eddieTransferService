@@ -39,19 +39,19 @@ check. Once dependencies are ready, run each launcher command separately:
 .venv/bin/python -m katgateway --port 8001
 ```
 
-Configure prompts for the database password, checks archive counts and writes
-.env.live.json with permissions 600 in the current account's checkout. Each
-account creates its own private settings. It creates separate read/write API tokens
-without printing them. The command above binds only to 127.0.0.1:8001. Leave it
+Configure prompts for the restricted API database password, checks archive
+counts and writes .env.live.json with permissions 600 in the current account's
+checkout. Apply schema/migrations/002_api_tokens.sql to the live archive as its
+owner before starting the new gateway. Create users and tokens separately with
+the owner-only CLI; the command above binds only to 127.0.0.1:8001. Leave it
 running for the SSH-tunnel check; the administrator's NGINX route is separate.
 Coordinate the selected account: only one API instance can use port 8001 at a time.
 
 The administrator service template uses TEAM_USER and the path
 /home/TEAM_USER/csit321-gateway/kat-transfer. Replace every TEAM_USER with the
 selected server username and use the actual absolute checkout path if it differs.
-The schema file is a reference
-only: the existing experimentaldata archive already has the expected tables.
-Do not execute schema initialisation SQL as part of this preparation.
+remote_postgres.sql is only for a new archive and must not be executed on live
+data. The separate token migration above is safe for the existing archive.
 
 SOURCE_MANIFEST.json records the SHA-256 of every packaged source file.
 """
@@ -63,7 +63,7 @@ def main() -> None:
         "requirements-server.txt", ".gitignore",
         "deploy/nginx.live.conf", "deploy/katgateway.service.example", "deploy/grants.example.sql",
         "docs/deployment.md", "docs/gateway-api.md", "docs/pgadmin-checks.sql",
-        "schema/remote_postgres.sql",
+        "schema/remote_postgres.sql", "schema/migrations/002_api_tokens.sql",
     )]
     manifest = {}
     for path in files:
