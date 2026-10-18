@@ -29,13 +29,45 @@ python -m katgateway --admin-user <issuer_login> token list
 python -m katgateway --admin-user <issuer_login> token revoke <id-or-prefix>
 python -m katgateway --admin-user <issuer_login> user set-role alice read --granted-by <admin>
 python -m katgateway --admin-user <issuer_login> user disable alice
+python -m katgateway --admin-user <issuer_login> user set-password alice
 ```
 
 `token create` prints the bearer token once; it cannot be recovered from the
-database. Expiry is 1-90 days and defaults to 90 days. There is not yet a
-user-facing sign-in/token-issuing flow; the future transfer-service app will
-authenticate users before issuance. See [deployment](deployment.md) for the
-migration and database grants.
+database. Expiry is 1-90 days and defaults to 90 days. See
+[deployment](deployment.md) for the migrations and database grants.
+
+### Sign-in
+
+Users with a password set by `user set-password` can get their own token
+without an administrator. The desktop transfer app uses these routes; they share
+the base URL of the other endpoints.
+
+| Method | Route | Sends | Returns |
+|---|---|---|---|
+| POST | `/v1/auth/login` | JSON `username`, `password`, optional `role` (`write` default, or `read`) and `expires_days` (1-90, default 90) | `token`, `token_id`, `username`, `role`, `expires_at` |
+| GET | `/v1/auth/me` | Bearer token | `token_id`, `username`, `role`, `expires_at`; 401 if the token no longer works |
+| POST | `/v1/auth/logout` | Bearer token | 204; that token is revoked immediately |
+
+```bash
+curl -X POST https://<host>/csit321/v1/auth/login -H "Content-Type: application/json" \
+     -d '{"username": "alice", "password": "<password>", "role": "write"}'
+```
+
+- Wrong password, unknown user, inactive user or a user with no password all
+  return the same 401 `Incorrect username or password`.
+- Asking for `write` when the user's `max_role` is `read` returns 403
+  `Your account can view but not send data`; no token is issued.
+- Five failed attempts for one username within five minutes return 429 with
+  `Retry-After`. NGINX limits attempts per client address (`deploy/nginx.live.conf`).
+- Sign-in requires HTTPS: a request forwarded with `X-Forwarded-Proto` other than
+  `https` gets 403. Direct loopback requests (an SSH tunnel) are allowed.
+- The token is returned once with `Cache-Control: no-store`. Passwords and tokens
+  are never logged; only the SHA-256 token hash and a salted scrypt password hash
+  are stored.
+- The gateway issues and revokes sign-in tokens through a separate issuer
+  database login (`KAT_ISSUER_PG_USER` / `KAT_ISSUER_PG_PASSWORD`). Without one,
+  login and logout return 503 and admin-issued tokens keep working. The ingest
+  database role still cannot create tokens or read password hashes.
 
 `/health`, `/docs` and `/openapi.json` expose process health or documentation
 without archive data.

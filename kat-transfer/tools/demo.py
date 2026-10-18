@@ -54,6 +54,13 @@ def main():
                          "Run `python tools/demo.py --resend` to send them to the local demo archive again.")
 
     subprocess.run(["docker", "compose", "up", "-d", "--build", "--wait"], cwd=ROOT, check=True)
+    # A demo volume created before a migration existed does not rerun the schema; apply them (idempotent).
+    migrations = "
+".join(path.read_text(encoding="utf-8")
+                           for path in sorted((ROOT / "schema/migrations").glob("*.sql")))
+    subprocess.run(["docker", "compose", "exec", "-T", "remote-db", "psql", "-q", "-v", "ON_ERROR_STOP=1",
+                    "-U", os.environ["KAT_PG_USER"], "-d", os.environ["KAT_PG_DATABASE"]],
+                   cwd=ROOT, check=True, input=migrations, capture_output=True, text=True)
     username = "demo-" + secrets.token_hex(4)
     admin = ["docker", "compose", "exec", "-T", "gateway", "python", "-m", "katgateway",
              "--admin-user", os.environ["KAT_PG_USER"],
@@ -72,9 +79,19 @@ def main():
     if ": " not in token_line:
         raise RuntimeError("Token administration command did not return the one-time token")
     os.environ["KAT_API_WRITE_TOKEN"] = token_line.rsplit(": ", 1)[1]
+    # A sign-in password for the same demo user, for trying /v1/auth/login and the desktop app.
+    password = secrets.token_urlsafe(18)
+    subprocess.run(
+        ["docker", "compose", "exec", "-T", "-e", f"KAT_DEMO_PASSWORD={password}", *admin[4:],
+         "user", "set-password", username, "--password-env", "KAT_DEMO_PASSWORD"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    managed = ("KAT_API_WRITE_TOKEN=", "KAT_DEMO_USER=", "KAT_DEMO_PASSWORD=")
     env_lines = [line for line in env_file.read_text(encoding="utf-8-sig").splitlines()
-                 if not line.startswith("KAT_API_WRITE_TOKEN=")]
+                 if not line.startswith(managed)]
     env_lines.append(f"KAT_API_WRITE_TOKEN={os.environ['KAT_API_WRITE_TOKEN']}")
+    env_lines.append(f"KAT_DEMO_USER={username}")
+    env_lines.append(f"KAT_DEMO_PASSWORD={password}")
     env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
     from katxfer.config import load

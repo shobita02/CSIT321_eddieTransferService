@@ -14,6 +14,7 @@ import sys
 import psycopg2
 
 from .config import DatabaseConfig, Settings
+from .passwords import hash_password
 from .storage import ArchiveStore
 
 DEFAULT_SETTINGS = Path(__file__).resolve().parent.parent / ".env.live.json"
@@ -22,6 +23,8 @@ DEFAULT_SETTINGS = Path(__file__).resolve().parent.parent / ".env.live.json"
 def save_settings(path: Path, settings: Settings) -> None:
     """Create only; a repeated setup cannot replace existing database credentials."""
     payload = {"version": 2, "database": asdict(settings.database)}
+    if settings.issuer is not None:
+        payload["issuer"] = {"user": settings.issuer.user, "password": settings.issuer.password}
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         json.dump(payload, stream, indent=2)
@@ -36,7 +39,7 @@ def load_settings(path: Path) -> Settings:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError("Settings must belong to this account and have permissions 600")
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if (not isinstance(raw, dict) or set(raw) != {"version", "database"}
+    if (not isinstance(raw, dict) or set(raw) - {"issuer"} != {"version", "database"}
             or type(raw["version"]) is not int or raw["version"] != 2):
         raise ValueError("Unsupported server settings format")
     db = raw["database"]
@@ -49,7 +52,14 @@ def load_settings(path: Path) -> Settings:
     if (type(db["port"]) is not int or not 1 <= db["port"] <= 65535
             or type(db["connect_timeout_s"]) is not int or db["connect_timeout_s"] <= 0):
         raise ValueError("Invalid database port or timeout")
-    return Settings(DatabaseConfig(**db))
+    database = DatabaseConfig(**db)
+    issuer = raw.get("issuer")
+    if issuer is None:
+        return Settings(database)
+    if (not isinstance(issuer, dict) or set(issuer) != {"user", "password"}
+            or any(not isinstance(issuer[name], str) or not issuer[name] for name in issuer)):
+        raise ValueError("Issuer settings must contain a nonempty user and password")
+    return Settings(database, replace(database, **issuer))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -65,6 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pg-database", default="experimentaldata")
     parser.add_argument("--pg-user", default="csit")
     parser.add_argument("--pg-sslmode", default="prefer")
+    parser.add_argument("--issuer-user", help="with --configure: separate login used to issue sign-in tokens")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--root-path", default="", help="use /csit321 when the NGINX route is configured")
 
@@ -93,7 +104,19 @@ def _parser() -> argparse.ArgumentParser:
     set_role.add_argument("--granted-by", required=True)
     disable = user_actions.add_parser("disable")
     disable.add_argument("username")
+    set_password = user_actions.add_parser("set-password", help="set the password used for /v1/auth/login")
+    set_password.add_argument("username")
+    set_password.add_argument("--password-env", help="read the new password from this environment variable")
     return parser
+
+
+def _new_password(args) -> str:
+    if args.password_env:
+        return os.environ.get(args.password_env, "")
+    password = getpass.getpass(f"New sign-in password for {args.username}: ")
+    if password != getpass.getpass("Repeat the password: "):
+        raise ValueError("The passwords did not match")
+    return password
 
 
 def _admin_store(settings: Settings, admin_user: str | None, password_env: str | None) -> ArchiveStore:
@@ -118,7 +141,7 @@ def _run_admin(args, settings: Settings) -> int:
     store = _admin_store(settings, args.admin_user, args.admin_password_env)
     if args.command == "token":
         if args.token_action == "create":
-            token_id, token = store.create_token(
+            token_id, token, _ = store.create_token(
                 args.user, args.role, _expiry_days(args.expires), args.note
             )
             print(f"Token {token_id} (shown once): {token}")
@@ -133,6 +156,10 @@ def _run_admin(args, settings: Settings) -> int:
     elif args.user_action == "add":
         store.add_user(args.username, args.role, args.granted_by, args.note)
         print("User added.")
+    elif args.user_action == "set-password":
+        if not store.set_user_password(args.username, hash_password(_new_password(args))):
+            raise ValueError("No active user matched that username")
+        print("Sign-in password set.")
     elif args.user_action == "set-role":
         if not store.set_user_role(args.username, args.role, args.granted_by):
             raise ValueError("No active user matched that username")
@@ -160,6 +187,11 @@ def main(argv=None) -> int:
                 host=args.pg_host, port=args.pg_port, database=args.pg_database,
                 user=args.pg_user, password=password, sslmode=args.pg_sslmode,
             ))
+            if args.issuer_user:
+                issuer_password = getpass.getpass(f"PostgreSQL password for issuer {args.issuer_user}: ")
+                if not issuer_password:
+                    raise ValueError("No issuer password entered")
+                settings.issuer = replace(settings.database, user=args.issuer_user, password=issuer_password)
             counts = ArchiveStore(settings.database).counts()
             save_settings(args.settings, settings)
             print("Archive connection verified:", counts)

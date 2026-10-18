@@ -26,6 +26,19 @@ def test_private_settings_round_trip_and_no_overwrite(tmp_path):
         assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_settings_with_issuer_login_round_trip(tmp_path):
+    path = tmp_path / ".env.live.json"
+    settings = profile()
+    settings.issuer = DatabaseConfig(database="experimentaldata", user="issuer", password="issuer-password")
+    launcher.save_settings(path, settings)
+    stored = launcher.load_settings(path)
+    assert (stored.issuer.user, stored.issuer.password) == ("issuer", "issuer-password")
+    assert stored.issuer.database == stored.database.database
+    plain = tmp_path / "plain.json"
+    launcher.save_settings(plain, profile())
+    assert launcher.load_settings(plain).issuer is None
+
+
 def test_setup_checks_archive_and_hides_secrets(tmp_path, monkeypatch, capsys):
     path = tmp_path / ".env.live.json"
     monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: "test-password")
@@ -88,7 +101,7 @@ def test_admin_token_create_prints_once_and_uses_separate_login(tmp_path, monkey
 
         def create_token(self, username, role, expires_days, note):
             assert (username, role, expires_days, note) == ("alice", "write", 90, "laptop")
-            return 7, "only-shown-once"
+            return 7, "only-shown-once", None
 
     monkeypatch.setattr(launcher, "ArchiveStore", Store)
     assert launcher.main([
@@ -127,18 +140,29 @@ def test_admin_list_revoke_and_user_commands(tmp_path, monkeypatch, capsys):
             calls.append(("disable", *args))
             return True
 
+        def set_user_password(self, username, password_hash):
+            calls.append(("set-password", username, password_hash.startswith("scrypt$")))
+            return True
+
     monkeypatch.setattr(launcher, "ArchiveStore", Store)
+    monkeypatch.setenv("NEW_SIGN_IN_PASSWORD", "a-long-sign-in-password")
     common = ["--settings", str(path), "--admin-user", "issuer"]
     assert launcher.main([*common, "token", "list"]) == 0
     assert '"token_prefix": "abc12345"' in capsys.readouterr().out
     assert launcher.main([*common, "token", "revoke", "abc12345"]) == 0
     assert launcher.main([*common, "user", "add", "alice", "--role", "read", "--granted-by", "admin"]) == 0
     assert launcher.main([*common, "user", "set-role", "alice", "write", "--granted-by", "admin"]) == 0
+    set_password = [*common, "user", "set-password", "alice", "--password-env", "NEW_SIGN_IN_PASSWORD"]
+    assert launcher.main(set_password) == 0
+    assert "a-long-sign-in-password" not in capsys.readouterr().out
+    monkeypatch.setenv("NEW_SIGN_IN_PASSWORD", "short")
+    assert launcher.main(set_password) == 1
     assert launcher.main([*common, "user", "disable", "alice"]) == 0
     assert calls == [
         ("revoke", "abc12345"),
         ("add", "alice", "read", "admin", None),
         ("set-role", "alice", "write", "admin"),
+        ("set-password", "alice", True),
         ("disable", "alice"),
     ]
 

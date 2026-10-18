@@ -72,3 +72,21 @@ class Receipt(Model):
     committed: Literal[True] = True
     sent: int
     applied: int
+
+
+class LoginRequest(Model):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=1024)
+    role: Literal["read", "write"] = "write"
+    expires_days: int = Field(default=90, ge=1, le=90)
+
+
+class TokenIdentity(Model):
+    token_id: int
+    username: str
+    role: Literal["read", "write"]
+    expires_at: AwareDatetime | None
+
+
+class LoginResponse(TokenIdentity):
+    token: str

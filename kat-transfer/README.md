@@ -39,7 +39,9 @@ Successful uploads update the original KAT database's `xfer` stamps.
 
 Open [API documentation](http://127.0.0.1:8080/docs). To try data endpoints,
 click **Authorize** and paste the `KAT_API_WRITE_TOKEN` from `.env`; it can read
-and upload. Read tokens cannot upload.
+and upload. Read tokens cannot upload. The demo also gives that user a sign-in
+password (`KAT_DEMO_USER` / `KAT_DEMO_PASSWORD` in `.env`) for trying
+`POST /v1/auth/login` and the desktop app.
 
 The demo uses the existing KAT database at `~/katdata.db` and the local gateway
 at `http://127.0.0.1:8080`. If no rows are pending, it exits with an
@@ -114,6 +116,9 @@ All data endpoints require `Authorization: Bearer <token>`.
 | GET | `/v1/experimental-data` | Read measurements; filter by systemid, run or origin |
 | GET | `/v1/environment` | Read environment; filter by systemid, origin, from_ts or to_ts |
 | GET | `/v1/transfers` | Read successful transfer audit records |
+| POST | `/v1/auth/login` | Sign in with username and password; returns a personal token (no bearer needed) |
+| GET | `/v1/auth/me` | Who the bearer token belongs to, its role and expiry |
+| POST | `/v1/auth/logout` | Revoke the bearer token |
 | GET | `/docs`, `/openapi.json` | Interactive documentation and API contract |
 
 List endpoints return `{ "items": [...], "limit": 100, "offset": 0 }` in a stable

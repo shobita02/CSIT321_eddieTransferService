@@ -3,9 +3,10 @@
 import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -14,7 +15,10 @@ import psycopg2
 
 from .config import Settings
 from .limits import BodyLimit
-from .models import EnvironmentBatch, ExperimentBatch, ExperimentalBatch, Receipt
+from .models import (EnvironmentBatch, ExperimentBatch, ExperimentalBatch, LoginRequest, LoginResponse,
+                     Receipt, TokenIdentity)
+from .passwords import verify_password
+from .ratelimit import FailedLoginLimit
 from .storage import ArchiveStore
 
 log = logging.getLogger("katgateway")
@@ -29,11 +33,18 @@ class Access:
     token_id: int
     username: str
     role: Literal["read", "write"]
+    expires_at: datetime | None = None
 
 
-def create_app(settings: Settings | None = None, store=None) -> FastAPI:
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def create_app(settings: Settings | None = None, store=None, issuer_store=None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store if store is not None else ArchiveStore(settings.database)
+    if issuer_store is None and settings.issuer is not None:
+        issuer_store = ArchiveStore(settings.issuer)
+    login_limit = FailedLoginLimit()
     app = FastAPI(title="CSIT321 KAT Gateway and API", version="1.0.0",
                   description="Authenticated KAT ingestion and archive reads. Data is acknowledged only after commit.")
     app.state.store = store
@@ -45,11 +56,11 @@ def create_app(settings: Settings | None = None, store=None) -> FastAPI:
         identity = store.find_token(hashlib.sha256(token.encode()).hexdigest()) if token else None
         if identity is None:
             raise HTTPException(401, "A valid API bearer token is required", headers={"WWW-Authenticate": "Bearer"})
-        token_id, username, token_role, max_role = identity
+        token_id, username, token_role, max_role, expires_at = identity
         effective_role: Literal["read", "write"] = (
             "write" if token_role == max_role == "write" else "read"
         )
-        return Access(token_id=token_id, username=username, role=effective_role)
+        return Access(token_id=token_id, username=username, role=effective_role, expires_at=expires_at)
 
     def write_access(access: Annotated[Access, Depends(role)]):
         if access.role != "write":
@@ -134,6 +145,59 @@ def create_app(settings: Settings | None = None, store=None) -> FastAPI:
     def transfers(limit: Limit = 100, offset: Offset = 0):
         return page("transfer_log", limit, offset)
 
+    auth = APIRouter(prefix="/v1/auth", tags=["auth"])
+
+    def issuer():
+        if issuer_store is None:
+            raise HTTPException(503, "Sign-in is not enabled on this server")
+        return issuer_store
+
+    def require_https(request: Request):
+        forwarded = request.headers.get("x-forwarded-proto")
+        if forwarded is not None:
+            secure = forwarded.split(",")[0].strip().lower() == "https"
+        else:
+            secure = request.url.scheme == "https" or (request.client and request.client.host in LOOPBACK)
+        if not secure and not settings.allow_http_login:
+            raise HTTPException(403, "Sign-in requires HTTPS")
+
+    @auth.post("/login", response_model=LoginResponse, dependencies=[Depends(require_https)])
+    def login(body: LoginRequest, response: Response):
+        tokens = issuer()
+        wait = login_limit.retry_after(body.username)
+        if wait:
+            raise HTTPException(429, "Too many failed sign-in attempts; try again later",
+                                headers={"Retry-After": str(wait)})
+        account = tokens.user_credentials(body.username)
+        password_hash, max_role, active = account if account else (None, None, False)
+        # Always run the hash check so unknown users take as long as wrong passwords.
+        if not verify_password(body.password, password_hash) or not active:
+            login_limit.failed(body.username)
+            raise HTTPException(401, "Incorrect username or password")
+        login_limit.succeeded(body.username)
+        if body.role == "write" and max_role != "write":
+            raise HTTPException(403, "Your account can view but not send data")
+        try:
+            token_id, token, expires_at = tokens.create_token(body.username, body.role, body.expires_days, "sign-in")
+        except ValueError:
+            # The user was disabled or lowered between the check and the insert.
+            raise HTTPException(403, "Your account is not permitted to hold this role") from None
+        response.headers["Cache-Control"] = "no-store"
+        log.info("Issued %s token %s to %s via sign-in", body.role, token_id, body.username)
+        return LoginResponse(token=token, token_id=token_id, username=body.username,
+                             role=body.role, expires_at=expires_at)
+
+    @auth.get("/me", response_model=TokenIdentity)
+    def me(access: Annotated[Access, Depends(role)]):
+        return TokenIdentity(token_id=access.token_id, username=access.username,
+                             role=access.role, expires_at=access.expires_at)
+
+    @auth.post("/logout", status_code=204)
+    def logout(access: Annotated[Access, Depends(role)]):
+        issuer().revoke_token_by_id(access.token_id)
+        return Response(status_code=204)
+
     app.include_router(reads)
     app.include_router(writes)
+    app.include_router(auth)
     return app

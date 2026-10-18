@@ -39,7 +39,7 @@ def test_body_limit_and_documentation_work_with_live_prefix():
         def find_token(self, token_hash):
             import hashlib
             if token_hash == hashlib.sha256(WRITE_TOKEN.encode()).hexdigest():
-                return 1, "writer", "write", "write"
+                return 1, "writer", "write", "write", None
             return None
 
     app = create_app(Settings(DatabaseConfig()), Store())

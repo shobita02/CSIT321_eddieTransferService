@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS api_user (
     granted_by  VARCHAR(64) NOT NULL,
     note        TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    disabled_at TIMESTAMPTZ
+    disabled_at TIMESTAMPTZ,
+    password_hash TEXT  -- salted scrypt for gateway sign-in; NULL means sign-in is not allowed
 );
 
 CREATE TABLE IF NOT EXISTS api_token (

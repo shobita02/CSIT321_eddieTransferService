@@ -33,15 +33,26 @@ Use its existing schema if it is installed. Apply
 authorization without reinitialising the live database. The live compose file
 does not run initialization SQL. Do not drop or reset the live archive.
 
-For example, from the project folder, apply the additive migration with
+For example, from the project folder, apply the additive migrations in order with
 `psql -h <database-host> -U <archive-owner> -d experimentaldata -f schema/migrations/002_api_tokens.sql`
-before deploying the new gateway.
+and then `-f schema/migrations/003_api_user_password.sql` (sign-in passwords)
+before deploying the new gateway. Both can safely be applied again.
 
 Use a restricted database role for the API and a separate owner-managed login
 for token/user administration. `deploy/grants.example.sql` shows the required
 permissions: the API can read users/tokens and update only `last_used_at`; it
-cannot create or delete tokens. The issuer login is used only by the CLI, not
-the running gateway.
+cannot create or delete tokens, and it can read only `username`, `max_role` and
+`active` from `api_user`, never password hashes.
+
+To enable user sign-in (`/v1/auth/login`), give the gateway the issuer login as
+well: run `--configure --issuer-user <issuer_login>` (it prompts for that
+password and stores it in the private settings file), or set
+`KAT_ISSUER_PG_USER` / `KAT_ISSUER_PG_PASSWORD` for the container. The gateway
+uses it only to issue and revoke sign-in tokens; uploads and reads keep using
+the restricted API role. Then set each user's password once:
+`python -m katgateway --admin-user <issuer_login> user set-password <name>`.
+Add the `limit_req_zone` line and the `/csit321/v1/auth/login` location from
+`deploy/nginx.live.conf` so NGINX also limits attempts per client address.
 
 ## Native Python setup for a team account
 

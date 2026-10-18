@@ -20,7 +20,7 @@ class ArchiveStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """WITH matched AS MATERIALIZED (
-                           SELECT t.id, t.username, t.role, u.max_role
+                           SELECT t.id, t.username, t.role, u.max_role, t.expires_at
                            FROM api_token t
                            JOIN api_user u ON u.username = t.username
                            WHERE t.token_hash = %s AND t.revoked_at IS NULL
@@ -33,7 +33,7 @@ class ArchiveStore:
                              AND (t.last_used_at IS NULL OR t.last_used_at < now() - interval '1 minute')
                            RETURNING t.id
                        )
-                       SELECT id, username, role, max_role FROM matched""",
+                       SELECT id, username, role, max_role, expires_at FROM matched""",
                     (token_hash,),
                 )
                 return cur.fetchone()
@@ -195,13 +195,35 @@ class ArchiveStore:
                        FROM api_user
                        WHERE username = %s AND active
                          AND (max_role = 'write' OR %s = 'read')
-                       RETURNING id""",
+                       RETURNING id, expires_at""",
                     (role, token_hash, token[:8], note, expires_days, username, role),
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise ValueError("User is inactive, unknown, or not permitted to hold this role")
-        return row[0], token
+        return row[0], token, row[1]
+
+    def user_credentials(self, username):
+        """Return (password_hash, max_role, active) for sign-in, or None for an unknown user."""
+        with self.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT password_hash, max_role, active FROM api_user WHERE username = %s",
+                            (username,))
+                return cur.fetchone()
+
+    def set_user_password(self, username, password_hash):
+        with self.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE api_user SET password_hash = %s WHERE username = %s AND active",
+                            (password_hash, username))
+                return cur.rowcount == 1
+
+    def revoke_token_by_id(self, token_id):
+        with self.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE api_token SET revoked_at = now() WHERE id = %s AND revoked_at IS NULL",
+                            (token_id,))
+                return cur.rowcount == 1
 
     def list_tokens(self):
         with self.connection() as conn:

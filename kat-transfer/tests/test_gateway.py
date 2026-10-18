@@ -40,8 +40,8 @@ class RecordingStore:
 
     def find_token(self, token_hash):
         identities = {
-            hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(): (2, "writer", "write", "write"),
-            hashlib.sha256(READ_TOKEN.encode()).hexdigest(): (1, "reader", "read", "read"),
+            hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(): (2, "writer", "write", "write", None),
+            hashlib.sha256(READ_TOKEN.encode()).hexdigest(): (1, "reader", "read", "read", None),
         }
         return identities.get(token_hash)
 
@@ -304,7 +304,7 @@ def test_token_admin_storage_create_list_and_revoke(remote):
     with pytest.raises(ValueError, match="not permitted"):
         store.create_token("read-only", "write")
 
-    token_id, token = store.create_token("read-only", "read", note="research laptop")
+    token_id, token, _ = store.create_token("read-only", "read", note="research laptop")
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     listed = next(token_row for token_row in store.list_tokens() if token_row["id"] == token_id)
     assert listed["token_prefix"] == token[:8]
@@ -319,9 +319,144 @@ def test_token_admin_storage_create_list_and_revoke(remote):
         assert api.get("/v1/status", headers=headers).status_code == 401
     assert not store.revoke_token(str(token_id))
 
-    _, disabled_token = store.create_token("read-only", "read")
+    _, disabled_token, _ = store.create_token("read-only", "read")
     assert store.disable_user("read-only")
     with TestClient(create_app(Settings(remote))) as api:
         assert api.get("/v1/status", headers={"Authorization": "Bearer " + disabled_token}).status_code == 401
     assert all(row["revoked_at"] is not None
                for row in store.list_tokens() if row["username"] == "read-only")
+
+
+SIGN_IN_PASSWORD = "correct-horse-battery"
+HTTPS = {"X-Forwarded-Proto": "https"}
+
+
+class FakeIssuer:
+    """Sign-in accounts and the tokens issued to them."""
+
+    def __init__(self):
+        from katgateway.passwords import hash_password
+        self.accounts = {
+            "alice": (hash_password(SIGN_IN_PASSWORD), "write", True),
+            "reader": (hash_password(SIGN_IN_PASSWORD), "read", True),
+            "gone": (hash_password(SIGN_IN_PASSWORD), "write", False),
+        }
+        self.issued = {}
+        self.revoked = []
+
+    def user_credentials(self, username):
+        return self.accounts.get(username)
+
+    def create_token(self, username, role, expires_days, note):
+        from datetime import datetime, timedelta, timezone
+        token_id = 100 + len(self.issued)
+        token = f"issued-token-{token_id}-0123456789abcdef"
+        expires_at = datetime(2026, 10, 1, tzinfo=timezone.utc) + timedelta(days=expires_days)
+        self.issued[hashlib.sha256(token.encode()).hexdigest()] = (
+            token_id, username, role, self.accounts[username][1], expires_at)
+        return token_id, token, expires_at
+
+    def revoke_token_by_id(self, token_id):
+        self.revoked.append(token_id)
+        self.issued = {key: value for key, value in self.issued.items() if value[0] != token_id}
+        return True
+
+
+@pytest.fixture
+def auth_client():
+    store = RecordingStore()
+    issuer = FakeIssuer()
+    base_find = store.find_token
+    store.find_token = lambda token_hash: issuer.issued.get(token_hash) or base_find(token_hash)
+    with TestClient(create_app(Settings(DatabaseConfig()), store, issuer)) as api:
+        yield api, store, issuer
+
+
+def login(api, username="alice", password=SIGN_IN_PASSWORD, **extra):
+    return api.post("/v1/auth/login", headers=HTTPS,
+                    json={"username": username, "password": password, **extra})
+
+
+def test_sign_in_issues_a_token_that_uploads_and_logs_out(auth_client, caplog):
+    api, store, issuer = auth_client
+    response = login(api, expires_days=30)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    issued = response.json()
+    assert (issued["username"], issued["role"], issued["token_id"]) == ("alice", "write", 100)
+    assert issued["expires_at"].startswith("2026-10-31")
+    headers = {"Authorization": "Bearer " + issued["token"]}
+
+    assert api.get("/v1/auth/me", headers=headers).json() == {
+        "token_id": 100, "username": "alice", "role": "write", "expires_at": issued["expires_at"]}
+    assert api.post("/v1/ingest/experiments", headers=headers,
+                    json=batch([{"systemid": "RIG", "run": 1}])).status_code == 200
+    assert store.writes[-1][2] == 100
+
+    assert api.post("/v1/auth/logout", headers=headers).status_code == 204
+    assert issuer.revoked == [100]
+    assert api.get("/v1/auth/me", headers=headers).status_code == 401
+    assert issued["token"] not in caplog.text
+    assert SIGN_IN_PASSWORD not in caplog.text
+
+
+def test_failed_sign_in_is_generic_and_role_is_capped(auth_client):
+    api, _, issuer = auth_client
+    wrong = login(api, password="not-the-password")
+    unknown = login(api, username="nobody")
+    inactive = login(api, username="gone")
+    assert wrong.status_code == unknown.status_code == inactive.status_code == 401
+    assert wrong.json() == unknown.json() == inactive.json()
+    assert "not-the-password" not in wrong.text
+
+    refused = login(api, username="reader")
+    assert refused.status_code == 403
+    assert refused.json()["detail"] == "Your account can view but not send data"
+    assert login(api, username="reader", role="read").json()["role"] == "read"
+    assert len(issuer.issued) == 1
+    assert login(api, expires_days=91).status_code == 422
+
+
+def test_sign_in_rate_limit_https_and_disabled_issuer(auth_client):
+    api, _, _ = auth_client
+    for _ in range(5):
+        assert login(api, password="guessing-password").status_code == 401
+    limited = login(api)
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) > 0
+    assert login(api, username="reader", role="read").status_code == 200
+
+    plain = api.post("/v1/auth/login", headers={"X-Forwarded-Proto": "http"},
+                     json={"username": "reader", "password": SIGN_IN_PASSWORD, "role": "read"})
+    assert plain.status_code == 403
+
+    with TestClient(create_app(Settings(DatabaseConfig()), RecordingStore())) as disabled:
+        assert login(disabled).status_code == 503
+        assert disabled.get("/v1/auth/me", headers=READ_HEADERS).json()["username"] == "reader"
+        assert disabled.post("/v1/auth/logout", headers=READ_HEADERS).status_code == 503
+
+
+def test_sign_in_end_to_end_with_postgres(remote):
+    from katgateway.passwords import hash_password
+    store = ArchiveStore(remote)
+    store.add_user("signer", "write", "test-admin")
+    store.add_user("viewer", "read", "test-admin")
+    assert store.set_user_password("signer", hash_password(SIGN_IN_PASSWORD))
+    assert store.set_user_password("viewer", hash_password(SIGN_IN_PASSWORD))
+    stored = remote_query(remote, "SELECT password_hash FROM api_user WHERE username = 'signer'")[0][0]
+    assert stored.startswith("scrypt$") and SIGN_IN_PASSWORD not in stored
+
+    with TestClient(create_app(Settings(remote, issuer=remote))) as api:
+        assert login(api, username="viewer").status_code == 403
+        issued = login(api, username="signer").json()
+        headers = {"Authorization": "Bearer " + issued["token"]}
+        assert api.get("/v1/auth/me", headers=headers).json()["expires_at"] == issued["expires_at"]
+        assert api.post("/v1/ingest/experiments", headers=headers,
+                        json=batch([{"systemid": "RIG", "run": 1}])).status_code == 200
+        assert remote_query(remote, "SELECT api_token_id FROM transfer_log")[-1][0] == issued["token_id"]
+        note = remote_query(remote, f"SELECT note FROM api_token WHERE id = {issued['token_id']}")[0][0]
+        assert note == "sign-in"
+        assert api.post("/v1/auth/logout", headers=headers).status_code == 204
+        assert api.get("/v1/auth/me", headers=headers).status_code == 401
+    hashes = remote_query(remote, "SELECT token_hash FROM api_token")
+    assert all(issued["token"] not in row[0] for row in hashes)
