@@ -24,8 +24,6 @@ services:
       KAT_PG_USER: ${KAT_PG_USER:-kat}
       KAT_PG_PASSWORD: ${KAT_PG_PASSWORD:?Create .env}
       KAT_PG_SSLMODE: disable
-      KAT_API_WRITE_TOKEN: ${KAT_API_WRITE_TOKEN:?Generate a write token}
-      KAT_API_READ_TOKEN: ${KAT_API_READ_TOKEN:?Generate a read token}
     depends_on:
       remote-db:
         condition: service_healthy

@@ -12,7 +12,5 @@ services:
       KAT_PG_USER: ${KAT_PG_USER:?Set the API database role}
       KAT_PG_PASSWORD: ${KAT_PG_PASSWORD:?Set the API database password}
       KAT_PG_SSLMODE: ${KAT_PG_SSLMODE:-require}
-      KAT_API_WRITE_TOKEN: ${KAT_API_WRITE_TOKEN:?Set a write token}
-      KAT_API_READ_TOKEN: ${KAT_API_READ_TOKEN:?Set a read token}
     ports:
       - "127.0.0.1:8001:8000"

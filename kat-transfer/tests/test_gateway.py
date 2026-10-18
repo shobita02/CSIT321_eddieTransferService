@@ -1,4 +1,5 @@
 """Access control, validation and failure ordering at the HTTP boundary."""
+import hashlib
 import json
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from conftest import READ_TOKEN, WRITE_TOKEN, local_pending, remote_count, _conn
 from katgateway.app import create_app
 from katgateway.config import DatabaseConfig, Settings
 from katgateway.models import Receipt
+from katgateway.storage import ArchiveStore
 from katxfer.config import LocalConfig, RemoteConfig, ServiceConfig, ZmqConfig, load
 from katxfer.service import TransferService
 from katxfer.sinks import GatewayError, HttpSink
@@ -36,20 +38,27 @@ class RecordingStore:
     def records(self, *args, **kwargs):
         return []
 
-    def write_batch(self, table, payload):
-        self.writes.append((table, payload))
+    def find_token(self, token_hash):
+        identities = {
+            hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(): (2, "writer", "write", "write"),
+            hashlib.sha256(READ_TOKEN.encode()).hexdigest(): (1, "reader", "read", "read"),
+        }
+        return identities.get(token_hash)
+
+    def write_batch(self, table, payload, token_id):
+        self.writes.append((table, payload, token_id))
         return Receipt(sent=len(payload.rows), applied=len(payload.rows))
 
 
 @pytest.fixture
 def client():
     store = RecordingStore()
-    app = create_app(Settings(DatabaseConfig(), WRITE_TOKEN, READ_TOKEN), store)
+    app = create_app(Settings(DatabaseConfig()), store)
     with TestClient(app) as client:
         yield client, store
 
 
-def test_authentication_and_read_only_permissions(client):
+def test_authentication_and_read_only_permissions(client, caplog):
     api, store = client
     assert api.get("/health").status_code == 200
     assert api.get("/v1/status").status_code == 401
@@ -60,6 +69,12 @@ def test_authentication_and_read_only_permissions(client):
     assert not store.writes
     assert api.post("/v1/ingest/experiments", json=body, headers=HEADERS).json() == {
         "committed": True, "sent": 1, "applied": 1}
+    assert store.writes[-1][2] == 2
+    leaked_token = "a-never-logged-invalid-bearer"
+    response = api.get("/v1/status", headers={"Authorization": "Bearer " + leaked_token})
+    assert response.status_code == 401
+    assert leaked_token not in response.text
+    assert leaked_token not in caplog.text
 
 
 @pytest.mark.parametrize("changes", [
@@ -144,13 +159,12 @@ def test_config_migration_and_token_privacy(tmp_path, monkeypatch):
     path.write_text('[remote]\nhost="127.0.0.1"\nuser="kat"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="Direct PostgreSQL"):
         load(path)
-    with pytest.raises(ValueError, match="different"):
-        Settings(DatabaseConfig(), WRITE_TOKEN, WRITE_TOKEN)
+    assert Settings(DatabaseConfig()).database == DatabaseConfig()
 
 
 def test_read_filters_and_payload_preservation(cfg, remote):
     TransferService(cfg).run_once()
-    with TestClient(create_app(Settings(remote, WRITE_TOKEN, READ_TOKEN))) as api:
+    with TestClient(create_app(Settings(remote))) as api:
         response = api.get("/v1/experimental-data", headers=READ_HEADERS,
                            params={"systemid": "K4-RIG-01", "run": 1, "limit": 3, "offset": 2})
         items = response.json()["items"]
@@ -203,7 +217,7 @@ def test_audit_failure_rolls_back_data_and_leaves_local_pending(cfg, remote):
 
 
 def test_missing_parent_rejects_entire_batch(remote):
-    app = create_app(Settings(remote, WRITE_TOKEN, READ_TOKEN))
+    app = create_app(Settings(remote))
     with TestClient(app) as api:
         rows = [{"systemid": "RIG", "run": 999, "row_no": 1,
                  "ts": None, "data": '{}'}]
@@ -212,3 +226,102 @@ def test_missing_parent_rejects_entire_batch(remote):
         assert response.status_code == 409
     assert remote_count(remote, "experimental_data") == 0
     assert remote_count(remote, "transfer_log") == 0
+
+
+def test_revoked_expired_and_inactive_tokens_are_rejected(remote):
+    conn = _connect(remote)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE api_token SET revoked_at = now() WHERE token_hash = %s",
+                (hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(),),
+            )
+            cur.execute(
+                "UPDATE api_token SET expires_at = now() - interval '1 second' WHERE token_hash = %s",
+                (hashlib.sha256(READ_TOKEN.encode()).hexdigest(),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    with TestClient(create_app(Settings(remote))) as api:
+        assert api.get("/v1/status", headers=HEADERS).status_code == 401
+        assert api.get("/v1/status", headers=READ_HEADERS).status_code == 401
+
+
+def test_user_deactivation_and_role_downgrade_apply_to_existing_tokens(remote):
+    store = ArchiveStore(remote)
+    with TestClient(create_app(Settings(remote))) as api:
+        assert store.set_user_role("test-writer", "read", "test-admin")
+        assert api.get("/v1/status", headers=HEADERS).status_code == 200
+        assert api.post("/v1/ingest/experiments", headers=HEADERS,
+                        json=batch([{"systemid": "RIG", "run": 1}])).status_code == 403
+        assert store.set_user_role("test-writer", "write", "test-admin")
+        assert store.disable_user("test-writer")
+        assert api.get("/v1/status", headers=HEADERS).status_code == 401
+
+
+def test_separate_write_tokens_are_audited_and_only_hashes_are_stored(remote):
+    second_token = "second-write-token-not-stored-012345"
+    second_hash = hashlib.sha256(second_token.encode()).hexdigest()
+    conn = _connect(remote)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO api_user (username, max_role, granted_by) VALUES ('second-writer', 'write', 'admin')"
+            )
+            cur.execute(
+                """INSERT INTO api_token (username, role, token_hash, token_prefix)
+                   VALUES ('second-writer', 'write', %s, %s)""",
+                (second_hash, second_token[:8]),
+            )
+            cur.execute("SELECT id FROM api_token WHERE token_hash = %s", (second_hash,))
+            second_id = cur.fetchone()[0]
+            cur.execute("SELECT id FROM api_token WHERE token_hash = %s",
+                        (hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(),))
+            first_id = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    with TestClient(create_app(Settings(remote))) as api:
+        payload = batch([{"systemid": "RIG", "run": 1}])
+        assert api.post("/v1/ingest/experiments", headers=HEADERS, json=payload).status_code == 200
+        assert api.post("/v1/ingest/experiments",
+                        headers={"Authorization": "Bearer " + second_token}, json=payload).status_code == 200
+        transfers = api.get("/v1/transfers", headers=HEADERS).json()["items"]
+    assert [(row["api_token_id"], row["uploaded_by"]) for row in transfers] == [
+        (first_id, "test-writer"), (second_id, "second-writer")
+    ]
+    rows = remote_query(remote, "SELECT token_hash FROM api_token ORDER BY id")
+    hashes = {row[0].strip() for row in rows}
+    assert second_hash in hashes
+    assert second_token not in hashes
+
+
+def test_token_admin_storage_create_list_and_revoke(remote):
+    store = ArchiveStore(remote)
+    store.add_user("read-only", "read", "test-admin")
+    with pytest.raises(ValueError, match="not permitted"):
+        store.create_token("read-only", "write")
+
+    token_id, token = store.create_token("read-only", "read", note="research laptop")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    listed = next(token_row for token_row in store.list_tokens() if token_row["id"] == token_id)
+    assert listed["token_prefix"] == token[:8]
+    assert listed["role"] == "read"
+    assert token not in repr(listed)
+    assert remote_query(remote, "SELECT token_hash FROM api_token WHERE id = %s" % token_id)[0][0].strip() == token_hash
+
+    with TestClient(create_app(Settings(remote))) as api:
+        headers = {"Authorization": "Bearer " + token}
+        assert api.get("/v1/status", headers=headers).status_code == 200
+        assert store.revoke_token(token[:8])
+        assert api.get("/v1/status", headers=headers).status_code == 401
+    assert not store.revoke_token(str(token_id))
+
+    _, disabled_token = store.create_token("read-only", "read")
+    assert store.disable_user("read-only")
+    with TestClient(create_app(Settings(remote))) as api:
+        assert api.get("/v1/status", headers={"Authorization": "Bearer " + disabled_token}).status_code == 401
+    assert all(row["revoked_at"] is not None
+               for row in store.list_tokens() if row["username"] == "read-only")

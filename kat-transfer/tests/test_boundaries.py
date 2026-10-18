@@ -36,8 +36,13 @@ def test_gateway_url_keeps_reverse_proxy_prefix():
 
 def test_body_limit_and_documentation_work_with_live_prefix():
     class Store:
-        pass
-    app = create_app(Settings(DatabaseConfig(), WRITE_TOKEN, READ_TOKEN), Store())
+        def find_token(self, token_hash):
+            import hashlib
+            if token_hash == hashlib.sha256(WRITE_TOKEN.encode()).hexdigest():
+                return 1, "writer", "write", "write"
+            return None
+
+    app = create_app(Settings(DatabaseConfig()), Store())
     with TestClient(app, root_path="/csit321") as client:
         response = client.get("/csit321/docs")
         assert response.status_code == 200
