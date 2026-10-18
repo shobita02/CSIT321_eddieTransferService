@@ -10,7 +10,7 @@ import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import READ_TOKEN, WRITE_TOKEN, local_pending, remote_count, _connect
+from conftest import READ_TOKEN, WRITE_TOKEN, local_pending, remote_count, remote_query, _connect
 from katgateway.app import create_app
 from katgateway.config import DatabaseConfig, Settings
 from katgateway.models import Receipt
