@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from .config import DEFAULT_CONFIG_PATH, ServiceConfig, load as load_config
 from .localdb import LocalKatDb
-from .sinks import RemoteSink, build_sink
+from .sinks import GatewayAuthError, RemoteSink, build_sink
 
 if TYPE_CHECKING:  # import for type checkers only, never at runtime
     from .zmqbus import Subscriber
@@ -160,6 +160,11 @@ class TransferService:
             try:
                 self.drain(trigger)
                 return
+            except GatewayAuthError:
+                # An expired, revoked or read-only token never starts working
+                # again; stop so the caller can get a new one.
+                self._drop_sink()
+                raise
             except Exception as exc:  # noqa: BLE001 - any remote failure
                 self.stats.failures += 1
                 self._drop_sink()

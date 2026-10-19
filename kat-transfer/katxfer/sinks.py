@@ -74,6 +74,10 @@ class GatewayError(RuntimeError):
     """The gateway did not confirm a committed write."""
 
 
+class GatewayAuthError(GatewayError):
+    """The gateway refused the token (401/403). Retrying cannot succeed."""
+
+
 class HttpSink(RemoteSink):
     def __init__(self, cfg: RemoteConfig, origin: str, src_host: str) -> None:
         super().__init__(origin, src_host)
@@ -106,6 +110,8 @@ class HttpSink(RemoteSink):
             response = self._client.request(method, path.lstrip("/"), **kwargs)
         except httpx.HTTPError as exc:
             raise GatewayError("Gateway connection failed; pending rows will be retried") from exc
+        if response.status_code in (401, 403):
+            raise GatewayAuthError(f"Gateway refused the API token (HTTP {response.status_code})")
         if response.status_code != 200:
             # Do not echo arbitrary server bodies, local data or credentials.
             raise GatewayError(f"Gateway returned HTTP {response.status_code}; write not confirmed")

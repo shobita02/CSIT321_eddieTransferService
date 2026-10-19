@@ -1,70 +1,48 @@
 
-"""Dashboard for Eddie Transfer Service."""
+"""Status screen for Eddie Transfer Service. Transfers run until Quit or Sign out."""
 
 from __future__ import annotations
 
-import sys
-
-import threading
-import time
 from datetime import datetime
-from pathlib import Path
 
 import customtkinter as ctk
 
 from .controller import TransferController
 
+OK = "#4CAF50"
+WARN = "#E5A54B"
+BAD = "#E57373"
+
 
 class DashboardFrame(ctk.CTkFrame):
 
-    def __init__(self, master, username, on_logout):
+    def __init__(self, master, session, config_path, on_sign_out, on_auth_failed, on_quit):
         super().__init__(master, fg_color="#242424")
 
-        self.username = username
-        self.on_logout = on_logout
+        self.session = session
+        self.config_path = config_path
+        self.on_sign_out = on_sign_out
+        self.on_auth_failed = on_auth_failed
+        self.on_quit = on_quit
 
-        if getattr(sys, "frozen", False):
-            project_root = Path(sys.executable).resolve().parent
-        else:
-            project_root = Path(__file__).resolve().parent.parent
-
-        config_path = project_root / "config.local.toml"
-
-        # Real transfer service connected to the local test gateway.
-        self.controller = TransferController(
-            config_path=config_path,
-            simulation=False
-        )
-
-        self.logout_pending = False
+        self.controller = None
         self.poll_job = None
+        self.closing_action = None  # "quit" or "sign_out" while finishing a batch
+        self.last_cycles = 0
+        self.last_failures = 0
+        self.last_sent = 0
+        self.last_warning = ""
+        self.last_transfer = None
 
-        # Gateway monitoring
-        self.gateway_check_running = False
-        self.gateway_check_interval_s = 5.0
-        self.last_gateway_check = 0.0
-        self.closing = False
-
-        # Window layout
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         # ==========================
         # Header
         # ==========================
 
-        header = ctk.CTkFrame(
-            self,
-            fg_color="transparent"
-        )
-        header.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            padx=30,
-            pady=(20, 10)
-        )
-
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=30, pady=(20, 10))
         header.grid_columnconfigure(0, weight=1)
 
         title = ctk.CTkLabel(
@@ -72,536 +50,241 @@ class DashboardFrame(ctk.CTkFrame):
             text="Transfer Dashboard",
             font=ctk.CTkFont(size=32, weight="bold")
         )
-        title.grid(
-            row=0,
-            column=0,
-            sticky="w"
-        )
+        title.grid(row=0, column=0, sticky="w")
 
-        self.logout_button = ctk.CTkButton(
+        self.sign_out_button = ctk.CTkButton(
             header,
-            text="Logout",
-            width=150,
+            text="Sign out",
+            width=120,
             height=42,
             fg_color="#555555",
             hover_color="#666666",
-            command=self.logout
+            command=self.sign_out
         )
-        self.logout_button.grid(
-            row=0,
-            column=1,
-            sticky="e"
-        )
+        self.sign_out_button.grid(row=0, column=1, sticky="e", padx=(0, 10))
 
-        welcome = ctk.CTkLabel(
+        self.quit_button = ctk.CTkButton(
+            header,
+            text="Quit",
+            width=120,
+            height=42,
+            fg_color="#B83232",
+            hover_color="#922626",
+            command=self.quit
+        )
+        self.quit_button.grid(row=0, column=2, sticky="e")
+
+        expires = (
+            session.expires_at.astimezone().strftime("%d %b %Y %H:%M")
+            if session.expires_at else "never"
+        )
+        self.account_label = ctk.CTkLabel(
             self,
-            text=f"Welcome, {self.username}",
+            text=f"Signed in as {session.username}  ·  token expires {expires}",
             font=ctk.CTkFont(size=16),
-            text_color="gray"
+            text_color=WARN if session.expires_soon() else "gray"
         )
-        welcome.grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=30,
-            pady=(0, 20)
+        self.account_label.grid(row=1, column=0, sticky="w", padx=30, pady=(0, 4))
+
+        self.expiry_warning = ctk.CTkLabel(
+            self,
+            text=(
+                "Your token expires soon. Sign out and sign in again to renew it."
+                if session.expires_soon() else ""
+            ),
+            text_color=WARN
         )
+        self.expiry_warning.grid(row=2, column=0, sticky="w", padx=30)
 
         # ==========================
         # Service Status
         # ==========================
 
-        status_frame = ctk.CTkFrame(
-            self,
-            corner_radius=10
-        )
-        status_frame.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            padx=30,
-            pady=10
-        )
+        status_frame = ctk.CTkFrame(self, corner_radius=10)
+        status_frame.grid(row=3, column=0, sticky="ew", padx=30, pady=10)
+        status_frame.grid_columnconfigure(1, weight=1)
 
-        self.status_label = ctk.CTkLabel(
+        def row(label, index):
+            ctk.CTkLabel(
+                status_frame,
+                text=label,
+                font=ctk.CTkFont(size=16, weight="bold")
+            ).grid(row=index, column=0, sticky="nw", padx=(20, 15), pady=6)
+            value = ctk.CTkLabel(
+                status_frame,
+                text="--",
+                font=ctk.CTkFont(size=16),
+                justify="left",
+                anchor="w",
+                wraplength=520
+            )
+            value.grid(row=index, column=1, sticky="w", pady=6)
+            return value
+
+        self.status_label = row("Service", 0)
+        self.gateway_label = row("Gateway", 1)
+        self.db_label = row("KAT database", 2)
+        self.rows_label = row("Rows sent", 3)
+        self.last_label = row("Last transfer", 4)
+
+        self.restart_button = ctk.CTkButton(
             status_frame,
-            text="Service Status: Stopped",
-            font=ctk.CTkFont(size=22)
-        )
-        self.status_label.pack(
-            pady=(25, 15)
-        )
-
-        self.gateway_label = ctk.CTkLabel(
-            status_frame,
-            text="Gateway Status: Checking...",
-            font=ctk.CTkFont(size=16),
-            text_color="gray"
-        )
-        self.gateway_label.pack(
-            pady=(0, 25)
-        )
-
-        # ==========================
-        # Archive Statistics
-        # ==========================
-
-        stats_frame = ctk.CTkFrame(
-            self,
-            corner_radius=10
-        )
-        stats_frame.grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            padx=30,
-            pady=10
-        )
-
-        stats_title = ctk.CTkLabel(
-            stats_frame,
-            text="Archive Statistics",
-            font=ctk.CTkFont(size=22, weight="bold")
-        )
-        stats_title.pack(
-            pady=(20, 15)
-        )
-
-        stats_content = ctk.CTkFrame(
-            stats_frame,
-            fg_color="transparent"
-        )
-        stats_content.pack(
-            fill="x",
-            padx=30,
-            pady=(0, 20)
-        )
-
-        stats_content.grid_columnconfigure(
-            (0, 1, 2),
-            weight=1
-        )
-
-        self.experiment_count_label = ctk.CTkLabel(
-            stats_content,
-            text="Experiments\n--",
-            font=ctk.CTkFont(size=17),
-            justify="center"
-        )
-        self.experiment_count_label.grid(
-            row=0,
-            column=0,
-            padx=10,
-            pady=10
-        )
-
-        self.experimental_count_label = ctk.CTkLabel(
-            stats_content,
-            text="Experimental Data\n--",
-            font=ctk.CTkFont(size=17),
-            justify="center"
-        )
-        self.experimental_count_label.grid(
-            row=0,
-            column=1,
-            padx=10,
-            pady=10
-        )
-
-        self.environment_count_label = ctk.CTkLabel(
-            stats_content,
-            text="Environment\n--",
-            font=ctk.CTkFont(size=17),
-            justify="center"
-        )
-        self.environment_count_label.grid(
-            row=0,
-            column=2,
-            padx=10,
-            pady=10
-        )
-
-        # ==========================
-        # Transfer Controls
-        # ==========================
-
-        control_frame = ctk.CTkFrame(
-            self,
-            corner_radius=10
-        )
-        control_frame.grid(
-            row=4,
-            column=0,
-            sticky="ew",
-            padx=30,
-            pady=10
-        )
-
-        control_title = ctk.CTkLabel(
-            control_frame,
-            text="Transfer Controls",
-            font=ctk.CTkFont(size=24, weight="bold")
-        )
-        control_title.pack(
-            pady=(25, 15)
-        )
-
-        button_frame = ctk.CTkFrame(
-            control_frame,
-            fg_color="transparent"
-        )
-        button_frame.pack(
-            pady=(0, 25)
-        )
-
-        self.start_button = ctk.CTkButton(
-            button_frame,
-            text="Start Transfer",
-            width=220,
-            height=52,
+            text="Restart",
+            width=160,
+            height=40,
             fg_color="#16864F",
             hover_color="#11683D",
             command=self.start_transfer
-        )
-        self.start_button.grid(
-            row=0,
-            column=0,
-            padx=12
-        )
-
-        self.stop_button = ctk.CTkButton(
-            button_frame,
-            text="Stop Transfer",
-            width=220,
-            height=52,
-            fg_color="#B83232",
-            hover_color="#922626",
-            state="disabled",
-            command=self.stop_transfer
-        )
-        self.stop_button.grid(
-            row=0,
-            column=1,
-            padx=12
         )
 
         # ==========================
         # Activity Log
         # ==========================
 
-        log_frame = ctk.CTkFrame(
-            self,
-            corner_radius=10
-        )
-        log_frame.grid(
-            row=5,
-            column=0,
-            sticky="nsew",
-            padx=30,
-            pady=(10, 25)
-        )
+        log_frame = ctk.CTkFrame(self, corner_radius=10)
+        log_frame.grid(row=4, column=0, sticky="nsew", padx=30, pady=(10, 25))
 
-        log_title = ctk.CTkLabel(
+        ctk.CTkLabel(
             log_frame,
             text="Activity Log",
             font=ctk.CTkFont(size=22, weight="bold")
-        )
-        log_title.pack(
-            anchor="w",
-            padx=20,
-            pady=(20, 10)
-        )
+        ).pack(anchor="w", padx=20, pady=(20, 10))
 
         self.log_box = ctk.CTkTextbox(
             log_frame,
-            height=180,
+            height=160,
             font=ctk.CTkFont(size=14)
         )
-        self.log_box.pack(
-            fill="both",
-            expand=True,
-            padx=20,
-            pady=(0, 20)
-        )
+        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.log_box.configure(state="disabled")
 
-        self.log_box.configure(
-            state="disabled"
-        )
-
-        # Initial messages
-        self.add_log("Application ready.")
-        self.add_log("Local transfer mode enabled.")
-        self.add_log(
-            "Gateway: http://127.0.0.1:8080"
-        )
-        self.add_log("Waiting for transfer to start.")
-
-        # Begin event polling and gateway monitoring
-        self.poll_events()
+        self.start_transfer()
+        self.poll()
 
     # ==========================
     # Activity Log
     # ==========================
 
     def add_log(self, message):
-
         timestamp = datetime.now().strftime("%H:%M:%S")
-
-        self.log_box.configure(
-            state="normal"
-        )
-
-        self.log_box.insert(
-            "end",
-            f"[{timestamp}] {message}\n"
-        )
-
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"[{timestamp}] {message}\n")
         self.log_box.see("end")
-
-        self.log_box.configure(
-            state="disabled"
-        )
+        self.log_box.configure(state="disabled")
 
     # ==========================
     # Start Transfer
     # ==========================
 
     def start_transfer(self):
-
-        if self.controller.start():
-
-            self.start_button.configure(
-                state="disabled"
-            )
-
-            self.stop_button.configure(
-                state="normal"
-            )
-
-            self.add_log(
-                "Starting transfer service..."
-            )
-
-    # ==========================
-    # Stop Transfer
-    # ==========================
-
-    def stop_transfer(self):
-
-        if self.controller.stop():
-
-            self.start_button.configure(
-                state="disabled"
-            )
-
-            self.stop_button.configure(
-                state="disabled"
-            )
-
-            self.add_log(
-                "Waiting for transfer service to stop..."
-            )
-
-    # ==========================
-    # Gateway Monitoring
-    # ==========================
-
-    def refresh_gateway(self):
-        """
-        Check the gateway without blocking the GUI.
-        """
-
-        if self.gateway_check_running or self.closing:
+        self.restart_button.grid_forget()
+        self.last_cycles = self.last_failures = self.last_sent = 0
+        self.controller = TransferController(self.config_path, self.session)
+        try:
+            self.controller.start()
+        except Exception as exc:  # noqa: BLE001 - e.g. missing config or database
+            self.show_crash(f"{type(exc).__name__}: {exc}")
             return
+        self.status_label.configure(text="Running", text_color=OK)
+        # The service contacts the gateway only when KAT has rows to send.
+        self.gateway_label.configure(text="Waiting for new KAT data", text_color="gray")
+        self.db_label.configure(text=self.controller.snapshot()["db_path"])
+        self.add_log("Transfer service started. Rows are sent as KAT records them.")
 
-        self.gateway_check_running = True
-
-        def worker():
-            try:
-                self.controller.check_gateway()
-            finally:
-                self.gateway_check_running = False
-
-        threading.Thread(
-            target=worker,
-            daemon=True,
-            name="EddieGatewayMonitor"
-        ).start()
+    def show_crash(self, message):
+        self.status_label.configure(text=f"Stopped by an error: {message}", text_color=BAD)
+        self.add_log(f"ERROR: {message}")
+        self.restart_button.grid(row=5, column=1, sticky="w", pady=(6, 16))
 
     # ==========================
-    # Update Archive Statistics
+    # Status Polling
     # ==========================
 
-    def update_statistics(self, counts):
-        """
-        Display the number of records stored
-        in the remote PostgreSQL archive.
-        """
+    def poll(self):
+        controller = self.controller
 
-        experiments = counts.get("experiment", 0)
-        experimental = counts.get("experimental_data", 0)
-        environment = counts.get("environment", 0)
+        if controller is not None:
+            for kind, message in controller.get_events():
+                if kind == "warning":
+                    self.last_warning = message
+                    self.add_log(message)
+                elif kind == "auth_failed":
+                    self.poll_job = None
+                    self.on_auth_failed(message)
+                    return
+                elif kind == "crashed":
+                    if self.closing_action is None:
+                        self.show_crash(message)
+                elif kind == "stopped":
+                    self.add_log("Transfer service stopped.")
 
-        self.experiment_count_label.configure(
-            text=f"Experiments\n{experiments}"
+            self.update_status(controller.snapshot())
+
+            if self.closing_action and not controller.is_active():
+                action, self.closing_action = self.closing_action, None
+                self.poll_job = None
+                if action == "quit":
+                    self.on_quit()
+                else:
+                    self.on_sign_out()
+                return
+
+        self.poll_job = self.after(1000, self.poll)
+
+    def update_status(self, snap):
+        sent = snap["experimental_sent"] + snap["environment_sent"] + snap["experiments_sent"]
+        if sent > self.last_sent:
+            self.last_transfer = datetime.now()
+            self.last_sent = sent
+
+        if self.closing_action is None and self.controller.is_active():
+            if snap["failures"] > self.last_failures:
+                reason = self.last_warning or "the gateway did not respond"
+                self.gateway_label.configure(text=f"Retrying - {reason}", text_color=WARN)
+            elif snap["cycles"] > self.last_cycles:
+                self.gateway_label.configure(text="Connected", text_color=OK)
+        self.last_failures = snap["failures"]
+        self.last_cycles = snap["cycles"]
+
+        self.rows_label.configure(
+            text=(
+                f"{snap['experimental_sent']} measurement, "
+                f"{snap['environment_sent']} environment, "
+                f"{snap['experiments_sent']} experiment rows this session"
+            )
         )
-
-        self.experimental_count_label.configure(
-            text=f"Experimental Data\n{experimental}"
-        )
-
-        self.environment_count_label.configure(
-            text=f"Environment\n{environment}"
+        self.last_label.configure(
+            text=self.last_transfer.strftime("%H:%M:%S") if self.last_transfer else "nothing sent yet"
         )
 
     # ==========================
-    # Controller Event Polling
+    # Quit and Sign out
     # ==========================
 
-    def poll_events(self):
-
-        if self.closing:
+    def finish(self, action):
+        """Stop after the current batch, then run the action once the worker has ended."""
+        if self.closing_action is not None:
             return
-
-        for event_type, message in self.controller.get_events():
-
-            if event_type == "status":
-
-                self.status_label.configure(
-                    text=f"Service Status: {message}"
-                )
-
-                if message == "Stopped":
-
-                    self.start_button.configure(
-                        state="normal"
-                    )
-
-                    self.stop_button.configure(
-                        state="disabled"
-                    )
-
-                elif message == "Stopping":
-
-                    self.start_button.configure(
-                        state="disabled"
-                    )
-
-                    self.stop_button.configure(
-                        state="disabled"
-                    )
-
-                elif message.startswith("Running"):
-
-                    self.start_button.configure(
-                        state="disabled"
-                    )
-
-                    self.stop_button.configure(
-                        state="normal"
-                    )
-
-                elif message == "Starting":
-
-                    self.start_button.configure(
-                        state="disabled"
-                    )
-
-                    self.stop_button.configure(
-                        state="normal"
-                    )
-
-            elif event_type == "log":
-
-                self.add_log(message)
-
-            elif event_type == "error":
-
-                self.add_log(
-                    f"ERROR: {message}"
-                )
-
-            elif event_type == "gateway":
-
-                self.gateway_label.configure(
-                    text=f"Gateway Status: {message}",
-                    text_color=(
-                        "#4CAF50"
-                        if message == "Connected"
-                        else "#E57373"
-                    )
-                )
-
-            elif event_type == "statistics":
-
-                self.update_statistics(message)
-
-        # Logout only after the transfer worker stops.
-        if (
-            self.logout_pending
-            and not self.controller.is_active()
-        ):
-            self.logout_pending = False
-            self.on_logout()
-            return
-
-        # Check gateway every five seconds.
-        now = time.monotonic()
-
-        if (
-            not self.logout_pending
-            and not self.gateway_check_running
-            and now - self.last_gateway_check
-            >= self.gateway_check_interval_s
-        ):
-            self.last_gateway_check = now
-            self.refresh_gateway()
-
-        # Poll controller events every 200 milliseconds.
-        self.poll_job = self.after(
-            200,
-            self.poll_events
-        )
-
-    # ==========================
-    # Logout
-    # ==========================
-
-    def logout(self):
-
-        if self.logout_pending:
-            return
-
-        if self.controller.is_active():
-
-            self.logout_pending = True
-
-            self.logout_button.configure(
-                state="disabled"
-            )
-
+        self.closing_action = action
+        self.sign_out_button.configure(state="disabled")
+        self.quit_button.configure(state="disabled")
+        self.restart_button.grid_forget()
+        if self.controller is not None:
             self.controller.stop()
+        self.status_label.configure(text="Finishing current batch...", text_color="gray")
+        self.add_log("Finishing current batch...")
+        if self.poll_job is not None:
+            self.after_cancel(self.poll_job)
+        self.poll_job = self.after(100, self.poll)
 
-            self.add_log(
-                "Stopping service before logout..."
-            )
+    def quit(self):
+        self.finish("quit")
 
-        else:
-            self.on_logout()
-
-    # ==========================
-    # Cleanup
-    # ==========================
+    def sign_out(self):
+        self.finish("sign_out")
 
     def destroy(self):
-
-        self.closing = True
-
         if self.poll_job is not None:
             self.after_cancel(self.poll_job)
             self.poll_job = None
-
-        if self.controller.is_active():
-            self.controller.stop()
-
         super().destroy()
