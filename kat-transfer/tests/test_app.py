@@ -260,7 +260,8 @@ def test_signed_in_token_transfers_until_stopped(remote, api_url, kat_db, tmp_pa
     try:
         assert TOKEN_ENV not in __import__("os").environ, "token is not left in the environment"
         assert wait_for(lambda: remote_count(remote, "experimental_data") == 20)
-        assert controller.snapshot()["experimental_sent"] == 20
+        # The archive commits before the client counts the reply, so wait for the count too.
+        assert wait_for(lambda: controller.snapshot()["experimental_sent"] == 20)
     finally:
         controller.stop()
     assert controller.join(5), "Quit must finish within a few seconds"
