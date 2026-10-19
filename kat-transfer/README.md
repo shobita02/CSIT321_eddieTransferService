@@ -54,6 +54,17 @@ measurement and environment `xfer` stamps and resends all rows. These stamps
 are shared by clients using that source database: a local demo upload does not
 mean that the office archive has received the same records.
 
+## Desktop app
+
+`python -m katapp -c config.toml` opens a window: the user signs in with their
+gateway username and password, and transfers start and keep running until
+**Quit**. The personal token is kept in Windows Credential Manager, never in a
+file. See [the sign-in summary](docs/per-user-auth-summary.md) for details.
+
+`python tools/build_app.py` builds it as one Windows program,
+`dist/EddieTransfer.exe`, with the office gateway settings built in (needs
+`pip install pyinstaller==6.16.0`). Copy the exe anywhere, such as the desktop.
+
 ## Run the transfer client separately
 
 Set your personal upload token for the current terminal. For the local demo,

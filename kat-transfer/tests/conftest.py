@@ -205,7 +205,7 @@ def api_url(pg_remote):
     """Real HTTP transport over loopback, backed by the isolated test archive."""
     import uvicorn
     from katgateway.app import create_app
-    app = create_app(Settings(pg_remote))
+    app = create_app(Settings(pg_remote, issuer=pg_remote))
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
