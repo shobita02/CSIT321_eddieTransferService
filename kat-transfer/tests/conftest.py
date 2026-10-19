@@ -12,6 +12,7 @@ _PASSWORD. If PostgreSQL is unreachable, tests that need it are skipped.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import sqlite3
@@ -138,8 +139,20 @@ def remote(pg_remote: DatabaseConfig) -> DatabaseConfig:
     conn = _connect(pg_remote)
     with conn.cursor() as cur:
         cur.execute(
-            "TRUNCATE experiment, experimental_data, environment, transfer_log "
+            "TRUNCATE api_token, api_user, experiment, experimental_data, environment, transfer_log "
             "RESTART IDENTITY CASCADE"
+        )
+        cur.execute(
+            "INSERT INTO api_user (username, max_role, granted_by) VALUES "
+            "('test-writer', 'write', 'test-admin'), ('test-reader', 'read', 'test-admin')"
+        )
+        cur.executemany(
+            """INSERT INTO api_token (username, role, token_hash, token_prefix)
+               VALUES (%s, %s, %s, %s)""",
+            [
+                ("test-writer", "write", hashlib.sha256(WRITE_TOKEN.encode()).hexdigest(), WRITE_TOKEN[:8]),
+                ("test-reader", "read", hashlib.sha256(READ_TOKEN.encode()).hexdigest(), READ_TOKEN[:8]),
+            ],
         )
     conn.commit()
     conn.close()
@@ -192,7 +205,7 @@ def api_url(pg_remote):
     """Real HTTP transport over loopback, backed by the isolated test archive."""
     import uvicorn
     from katgateway.app import create_app
-    app = create_app(Settings(pg_remote, WRITE_TOKEN, READ_TOKEN))
+    app = create_app(Settings(pg_remote, issuer=pg_remote))
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]

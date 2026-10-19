@@ -1,11 +1,16 @@
 import customtkinter as ctk
 
+from .auth import AuthError
+from .background import run_in_background
+
 
 class LoginFrame(ctk.CTkFrame):
-    def __init__(self, master, on_login):
+    def __init__(self, master, auth, gateway_url, on_login, message=None, config_error=None):
         super().__init__(master, fg_color="transparent")
 
+        self.auth = auth
         self.on_login = on_login
+        self.busy = False
 
         container = ctk.CTkFrame(
             self,
@@ -47,23 +52,25 @@ class LoginFrame(ctk.CTkFrame):
 
         self.error_label = ctk.CTkLabel(
             container,
-            text="",
-            text_color="#ff6b6b"
+            text=config_error or message or "",
+            text_color="#ff6b6b",
+            wraplength=320
         )
         self.error_label.pack(pady=5)
 
-        login_button = ctk.CTkButton(
+        self.login_button = ctk.CTkButton(
             container,
             text="Sign In",
             width=320,
             height=42,
-            command=self.login
+            command=self.login,
+            state="disabled" if config_error else "normal"
         )
-        login_button.pack(pady=(10, 15))
+        self.login_button.pack(pady=(10, 15))
 
         note = ctk.CTkLabel(
             container,
-            text="Development mode - Authentication not connected",
+            text=f"Gateway: {gateway_url}" if gateway_url else "",
             font=("Arial", 11),
             text_color="gray"
         )
@@ -73,8 +80,12 @@ class LoginFrame(ctk.CTkFrame):
             "<Return>",
             lambda event: self.login()
         )
+        self.username_entry.focus_set()
 
     def login(self):
+        if self.busy or self.auth is None:
+            return
+
         username = self.username_entry.get().strip()
         password = self.password_entry.get()
 
@@ -84,8 +95,27 @@ class LoginFrame(ctk.CTkFrame):
             )
             return
 
-        # UI prototype only.
-        # This does NOT authenticate the user.
-        # Real authentication will be integrated later.
+        # The password leaves the entry field straight away and is only
+        # held by the sign-in request.
         self.password_entry.delete(0, "end")
-        self.on_login(username)
+        self.busy = True
+        self.login_button.configure(state="disabled", text="Signing in...")
+        self.error_label.configure(text="")
+
+        run_in_background(
+            self,
+            lambda: self.auth.login(username, password),
+            self._login_done
+        )
+
+    def _login_done(self, session, error):
+        self.busy = False
+        self.login_button.configure(state="normal", text="Sign In")
+
+        if error is not None:
+            message = error.message if isinstance(error, AuthError) else "Sign-in failed unexpectedly."
+            self.error_label.configure(text=message)
+            self.password_entry.focus_set()
+            return
+
+        self.on_login(session)

@@ -29,15 +29,19 @@ python -m pip install -r requirements.txt
 python tools/demo.py
 ```
 
-The demo generates an ignored `.env` file containing two separate random tokens
-if needed, starts local PostgreSQL, the API and NGINX, and transfers all pending
-measurement and environment rows from `~/katdata.db`. It compares the archived
-JSON text with SQLite. Record counts depend on the data recorded with KAT.
+The demo generates an ignored `.env` file with local database settings if
+needed, starts PostgreSQL, the API and NGINX, creates a temporary demo user and
+write token through the gateway's token command, then transfers pending
+measurement and environment rows from `~/katdata.db`. The one-time token is
+saved in ignored `.env` for local use. It compares archived JSON text with
+SQLite. Record counts depend on the data recorded with KAT.
 Successful uploads update the original KAT database's `xfer` stamps.
 
 Open [API documentation](http://127.0.0.1:8080/docs). To try data endpoints,
-click **Authorize** and paste the read token from your local `.env` file.
-The write token can also read, but only the write token can upload.
+click **Authorize** and paste the `KAT_API_WRITE_TOKEN` from `.env`; it can read
+and upload. Read tokens cannot upload. The demo also gives that user a sign-in
+password (`KAT_DEMO_USER` / `KAT_DEMO_PASSWORD` in `.env`) for trying
+`POST /v1/auth/login` and the desktop app.
 
 The demo uses the existing KAT database at `~/katdata.db` and the local gateway
 at `http://127.0.0.1:8080`. If no rows are pending, it exits with an
@@ -50,10 +54,21 @@ measurement and environment `xfer` stamps and resends all rows. These stamps
 are shared by clients using that source database: a local demo upload does not
 mean that the office archive has received the same records.
 
+## Desktop app
+
+`python -m katapp -c config.toml` opens a window: the user signs in with their
+gateway username and password, and transfers start and keep running until
+**Quit**. The personal token is kept in Windows Credential Manager, never in a
+file. See [the sign-in summary](docs/per-user-auth-summary.md) for details.
+
+`python tools/build_app.py` builds it as one Windows program,
+`dist/EddieTransfer.exe`, with the office gateway settings built in (needs
+`pip install pyinstaller==6.16.0`). Copy the exe anywhere, such as the desktop.
+
 ## Run the transfer client separately
 
-Set the upload token for the current terminal. For the local demo, this reads
-only its generated token without printing it:
+Set your personal upload token for the current terminal. For the local demo,
+load its generated token from `.env`:
 
 ```powershell
 $env:KAT_API_WRITE_TOKEN = (Get-Content .env | Where-Object { $_ -like 'KAT_API_WRITE_TOKEN=*' }) -replace '^KAT_API_WRITE_TOKEN=', ''
@@ -82,13 +97,13 @@ use trusted HTTPS for a remote server.
 
 1. The client reads a batch where `xfer IS NULL` and uploads its parent experiments.
 2. The API authenticates and validates each table batch before executing SQL.
-3. Data upserts and the measurement/environment audit record commit in one
+3. Every table upsert and its token-attributed audit record commit in one
    PostgreSQL transaction. The response confirms `committed`, `sent` and `applied`.
 4. Only a complete successful acknowledgement allows SQLite's `xfer` to be set.
 5. Timeouts, rejected requests and incomplete acknowledgements leave rows pending.
    A lost reply after commit causes a safe resend on the existing primary keys.
 
-The original schema and identity rules are retained. Measurement identity is
+The original data schema and identity rules are retained. Measurement identity is
 `(systemid, run, row_no)`; environment identity is `(systemid, timestamp)`.
 Repeated environment keys keep the last sample, as in the existing archive.
 JSON remains text inside the HTTP payload and is stored as PostgreSQL `json`,
@@ -112,6 +127,9 @@ All data endpoints require `Authorization: Bearer <token>`.
 | GET | `/v1/experimental-data` | Read measurements; filter by systemid, run or origin |
 | GET | `/v1/environment` | Read environment; filter by systemid, origin, from_ts or to_ts |
 | GET | `/v1/transfers` | Read successful transfer audit records |
+| POST | `/v1/auth/login` | Sign in with username and password; returns a personal token (no bearer needed) |
+| GET | `/v1/auth/me` | Who the bearer token belongs to, its role and expiry |
+| POST | `/v1/auth/logout` | Revoke the bearer token |
 | GET | `/docs`, `/openapi.json` | Interactive documentation and API contract |
 
 List endpoints return `{ "items": [...], "limit": 100, "offset": 0 }` in a stable
@@ -120,10 +138,11 @@ ISO 8601 with a timezone; environment ranges are inclusive. The `data` field is
 the original JSON string, or SQL null. Schema details and example requests are
 in [the API guide](docs/gateway-api.md).
 
-Replace the example system ID and run number below with values recorded by KAT:
+Replace the example system ID and run number below with values recorded by KAT.
+Set your personal read token in the current terminal:
 
 ```powershell
-$env:KAT_API_READ_TOKEN = (Get-Content .env | Where-Object { $_ -like 'KAT_API_READ_TOKEN=*' }) -replace '^KAT_API_READ_TOKEN=', ''
+$env:KAT_API_READ_TOKEN = '<personal read token issued by an administrator>'
 python tools/read_run.py --systemid K4-RIG-01 --run 1 --csv run1.csv
 ```
 
@@ -177,13 +196,14 @@ with `docker compose down`; its database volume is preserved.
 - `katgateway/`: authentication, validated API models and server-only PostgreSQL access
 - `deploy/`: local and live NGINX configuration
 - `tools/`: demo, fake data, verification, diagnostics and a researcher read example
-- `schema/`: existing KAT and PostgreSQL schemas
+- `schema/`: existing KAT/PostgreSQL schemas and the live token migration
 - `tests/`: transfer, API, retry, transaction, access-control and ZeroMQ checks
 - `requirements.txt`: client dependencies; `requirements-server.txt`: server dependencies
 
-This prototype uses one upload token and one read token. Per-user accounts,
-per-rig permissions, token rotation and an approved public-data policy are
-follow-up work for the team. `origin` and `src_host` are client-supplied provenance,
-not verified user identity. Offset pagination is for bounded reads; pause writes
-when producing a fixed verification snapshot. Schema migrations, backups and
-service monitoring remain deployment responsibilities.
+The gateway now uses per-user read/write tokens, expiry/revocation, and
+token-attributed transfer records. The future user sign-in/token-issuance UI,
+per-rig permissions, and an approved public-data policy remain follow-up work.
+`origin` and `src_host` are client-supplied provenance, not verified identity.
+Offset pagination is for bounded reads; pause writes when producing a fixed
+verification snapshot. Backups and service monitoring remain deployment
+responsibilities.

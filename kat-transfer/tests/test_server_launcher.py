@@ -1,16 +1,14 @@
-"""Private native settings and loopback-only server startup."""
+"""Private native settings, loopback-only startup and token administration."""
 import os
 
 import pytest
 
-from conftest import WRITE_TOKEN, READ_TOKEN
 from katgateway import __main__ as launcher
 from katgateway.config import DatabaseConfig, Settings
 
 
 def profile():
-    return Settings(DatabaseConfig(database="experimentaldata", user="csit", password="test-password"),
-                    WRITE_TOKEN, READ_TOKEN)
+    return Settings(DatabaseConfig(database="experimentaldata", user="csit", password="test-password"))
 
 
 def test_private_settings_round_trip_and_no_overwrite(tmp_path):
@@ -19,8 +17,6 @@ def test_private_settings_round_trip_and_no_overwrite(tmp_path):
     stored = launcher.load_settings(path)
     assert stored.database.password == "test-password"
     assert stored.database.database == "experimentaldata"
-    assert stored.read_token == READ_TOKEN
-    assert stored.write_token == WRITE_TOKEN
     assert "test-password" not in repr(stored)
     before = path.read_bytes()
     with pytest.raises(FileExistsError):
@@ -30,6 +26,19 @@ def test_private_settings_round_trip_and_no_overwrite(tmp_path):
         assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_settings_with_issuer_login_round_trip(tmp_path):
+    path = tmp_path / ".env.live.json"
+    settings = profile()
+    settings.issuer = DatabaseConfig(database="experimentaldata", user="issuer", password="issuer-password")
+    launcher.save_settings(path, settings)
+    stored = launcher.load_settings(path)
+    assert (stored.issuer.user, stored.issuer.password) == ("issuer", "issuer-password")
+    assert stored.issuer.database == stored.database.database
+    plain = tmp_path / "plain.json"
+    launcher.save_settings(plain, profile())
+    assert launcher.load_settings(plain).issuer is None
+
+
 def test_setup_checks_archive_and_hides_secrets(tmp_path, monkeypatch, capsys):
     path = tmp_path / ".env.live.json"
     monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: "test-password")
@@ -37,11 +46,8 @@ def test_setup_checks_archive_and_hides_secrets(tmp_path, monkeypatch, capsys):
         "experiment": 24, "experimental_data": 5277, "environment": 1})
     assert launcher.main(["--configure", "--settings", str(path)]) == 0
     out = capsys.readouterr().out
-    stored = launcher.load_settings(path)
     assert "5277" in out
     assert "test-password" not in out
-    assert stored.write_token not in out
-    assert stored.read_token not in out
     monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: pytest.fail("Existing settings must not prompt"))
     assert launcher.main(["--configure", "--settings", str(path)]) == 1
 
@@ -49,8 +55,10 @@ def test_setup_checks_archive_and_hides_secrets(tmp_path, monkeypatch, capsys):
 def test_failed_archive_check_does_not_save_profile(tmp_path, monkeypatch, capsys):
     path = tmp_path / ".env.live.json"
     monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: "test-password")
+
     def fail(store):
         raise launcher.psycopg2.OperationalError("private connection details")
+
     monkeypatch.setattr(launcher.ArchiveStore, "counts", fail)
     assert launcher.main(["--configure", "--settings", str(path)]) == 1
     assert not path.exists()
@@ -81,11 +89,89 @@ def test_world_readable_settings_are_rejected(tmp_path):
         launcher.load_settings(path)
 
 
-def test_print_token_returns_only_selected_token(tmp_path, capsys):
+def test_admin_token_create_prints_once_and_uses_separate_login(tmp_path, monkeypatch, capsys):
     path = tmp_path / ".env.live.json"
     launcher.save_settings(path, profile())
-    assert launcher.main(["--settings", str(path), "--print-token", "read"]) == 0
-    assert capsys.readouterr().out.strip() == READ_TOKEN
+    monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: "issuer-password")
+
+    class Store:
+        def __init__(self, cfg):
+            assert cfg.user == "issuer"
+            assert cfg.password == "issuer-password"
+
+        def create_token(self, username, role, expires_days, note):
+            assert (username, role, expires_days, note) == ("alice", "write", 90, "laptop")
+            return 7, "only-shown-once", None
+
+    monkeypatch.setattr(launcher, "ArchiveStore", Store)
+    assert launcher.main([
+        "--settings", str(path), "--admin-user", "issuer", "token", "create",
+        "--user", "alice", "--role", "write", "--note", "laptop",
+    ]) == 0
+    assert capsys.readouterr().out.strip() == "Token 7 (shown once): only-shown-once"
+
+
+def test_admin_list_revoke_and_user_commands(tmp_path, monkeypatch, capsys):
+    path = tmp_path / ".env.live.json"
+    launcher.save_settings(path, profile())
+    monkeypatch.setattr(launcher.getpass, "getpass", lambda prompt: "issuer-password")
+    calls = []
+
+    class Store:
+        def __init__(self, cfg):
+            pass
+
+        def list_tokens(self):
+            return [{"id": 4, "token_prefix": "abc12345", "username": "alice",
+                     "role": "read", "revoked_at": None}]
+
+        def revoke_token(self, selector):
+            calls.append(("revoke", selector))
+            return True
+
+        def add_user(self, *args):
+            calls.append(("add", *args))
+
+        def set_user_role(self, *args):
+            calls.append(("set-role", *args))
+            return True
+
+        def disable_user(self, *args):
+            calls.append(("disable", *args))
+            return True
+
+        def set_user_password(self, username, password_hash):
+            calls.append(("set-password", username, password_hash.startswith("scrypt$")))
+            return True
+
+    monkeypatch.setattr(launcher, "ArchiveStore", Store)
+    monkeypatch.setenv("NEW_SIGN_IN_PASSWORD", "a-long-sign-in-password")
+    common = ["--settings", str(path), "--admin-user", "issuer"]
+    assert launcher.main([*common, "token", "list"]) == 0
+    assert '"token_prefix": "abc12345"' in capsys.readouterr().out
+    assert launcher.main([*common, "token", "revoke", "abc12345"]) == 0
+    assert launcher.main([*common, "user", "add", "alice", "--role", "read", "--granted-by", "admin"]) == 0
+    assert launcher.main([*common, "user", "set-role", "alice", "write", "--granted-by", "admin"]) == 0
+    set_password = [*common, "user", "set-password", "alice", "--password-env", "NEW_SIGN_IN_PASSWORD"]
+    assert launcher.main(set_password) == 0
+    assert "a-long-sign-in-password" not in capsys.readouterr().out
+    monkeypatch.setenv("NEW_SIGN_IN_PASSWORD", "short")
+    assert launcher.main(set_password) == 1
+    assert launcher.main([*common, "user", "disable", "alice"]) == 0
+    assert calls == [
+        ("revoke", "abc12345"),
+        ("add", "alice", "read", "admin", None),
+        ("set-role", "alice", "write", "admin"),
+        ("set-password", "alice", True),
+        ("disable", "alice"),
+    ]
+
+
+def test_admin_expiry_is_capped_at_90_days():
+    assert launcher._expiry_days("90d") == 90
+    for invalid in ("0d", "91d", "90", "1w"):
+        with pytest.raises(ValueError):
+            launcher._expiry_days(invalid)
 
 
 def test_malformed_profile_does_not_echo_its_contents(tmp_path, capsys):

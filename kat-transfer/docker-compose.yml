@@ -24,8 +24,11 @@ services:
       KAT_PG_USER: ${KAT_PG_USER:-kat}
       KAT_PG_PASSWORD: ${KAT_PG_PASSWORD:?Create .env}
       KAT_PG_SSLMODE: disable
-      KAT_API_WRITE_TOKEN: ${KAT_API_WRITE_TOKEN:?Generate a write token}
-      KAT_API_READ_TOKEN: ${KAT_API_READ_TOKEN:?Generate a read token}
+      # Local demo only: the database owner doubles as the sign-in token issuer,
+      # and sign-in is accepted over the loopback-only HTTP NGINX.
+      KAT_ISSUER_PG_USER: ${KAT_PG_USER:-kat}
+      KAT_ISSUER_PG_PASSWORD: ${KAT_PG_PASSWORD:?Create .env}
+      KAT_AUTH_ALLOW_HTTP: "1"
     depends_on:
       remote-db:
         condition: service_healthy

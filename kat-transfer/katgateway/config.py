@@ -1,6 +1,6 @@
 """Server settings; database credentials never enter the transfer client."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 
 
@@ -18,14 +18,10 @@ class DatabaseConfig:
 @dataclass
 class Settings:
     database: DatabaseConfig
-    write_token: str = field(repr=False)
-    read_token: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if any(len(token) < 32 or "${" in token for token in (self.write_token, self.read_token)):
-            raise ValueError("Set distinct KAT_API_WRITE_TOKEN and KAT_API_READ_TOKEN (at least 32 characters)")
-        if self.write_token == self.read_token:
-            raise ValueError("Read and write tokens must be different")
+    # Separate login for sign-in token issuing; None disables /v1/auth/login.
+    issuer: DatabaseConfig | None = None
+    # Local demo only: accept sign-in over plain HTTP from the loopback NGINX.
+    allow_http_login: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,14 +31,16 @@ class Settings:
                 raise ValueError(f"Set {name} on the API server")
             return value
 
-        return cls(
-            database=DatabaseConfig(
-                host=os.environ.get("KAT_PG_HOST", "127.0.0.1"),
-                port=int(os.environ.get("KAT_PG_PORT", "5432")),
-                database=required("KAT_PG_DATABASE"), user=required("KAT_PG_USER"),
-                password=required("KAT_PG_PASSWORD"),
-                sslmode=os.environ.get("KAT_PG_SSLMODE", "prefer"),
-            ),
-            write_token=required("KAT_API_WRITE_TOKEN"),
-            read_token=required("KAT_API_READ_TOKEN"),
+        database = DatabaseConfig(
+            host=os.environ.get("KAT_PG_HOST", "127.0.0.1"),
+            port=int(os.environ.get("KAT_PG_PORT", "5432")),
+            database=required("KAT_PG_DATABASE"), user=required("KAT_PG_USER"),
+            password=required("KAT_PG_PASSWORD"),
+            sslmode=os.environ.get("KAT_PG_SSLMODE", "prefer"),
         )
+        issuer = None
+        if os.environ.get("KAT_ISSUER_PG_USER"):
+            issuer = replace(database, user=os.environ["KAT_ISSUER_PG_USER"],
+                             password=required("KAT_ISSUER_PG_PASSWORD"))
+        return cls(database=database, issuer=issuer,
+                   allow_http_login=os.environ.get("KAT_AUTH_ALLOW_HTTP") == "1")

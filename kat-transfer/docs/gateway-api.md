@@ -2,19 +2,75 @@
 
 The ingestion gateway and researcher read API share one FastAPI application.
 NGINX provides the entry point. PostgreSQL is accessed only by `katgateway/storage.py`.
-The client implementation in `katxfer/sinks.py` contains no SQL or database driver.
+The client in `katxfer/sinks.py` contains no SQL or database driver.
 
-## Authentication
+## Authentication and token administration
 
-Send `Authorization: Bearer <token>` over HTTPS. The server requires two distinct
-tokens with at least 32 characters, loaded from `KAT_API_WRITE_TOKEN` and
-`KAT_API_READ_TOKEN`. Generate random values; length alone does not provide security.
+Send `Authorization: Bearer <personal-token>` over HTTPS. Each token belongs to
+a named `api_user` and has a `read` or `write` role. The laptop transfer client
+uses the user's write token in `KAT_API_WRITE_TOKEN`; researchers may use their
+read token in `KAT_API_READ_TOKEN`. Write tokens can read and upload; read tokens
+can only use GET endpoints.
 
-The read token can use archive GET endpoints. The upload token can read and use
-the three ingestion POST endpoints. Invalid or absent tokens return 401; a read
-token used for ingestion returns 403. `/health`, `/docs` and `/openapi.json` expose
-health or documentation without archive data. There is no token-issuing endpoint
-or user account system in this prototype. The administrator distributes tokens.
+The archive stores a SHA-256 hash and an eight-character recognition prefix,
+never the bearer token. The gateway resolves the hash against PostgreSQL on
+every request. Revocation, expiration, user deactivation and role changes
+therefore take effect without restarting the gateway. Inactive, expired,
+revoked or unknown tokens return 401. Read tokens, and write tokens whose user
+has been lowered to `read`, receive 403 on every ingestion route.
+
+Only administrators should run the token/user CLI, using a separate database
+owner/issuer login that is not available to the gateway process:
+
+```bash
+python -m katgateway --admin-user <issuer_login> user add alice --role write --granted-by <admin>
+python -m katgateway --admin-user <issuer_login> token create --user alice --role write --expires 90d
+python -m katgateway --admin-user <issuer_login> token list
+python -m katgateway --admin-user <issuer_login> token revoke <id-or-prefix>
+python -m katgateway --admin-user <issuer_login> user set-role alice read --granted-by <admin>
+python -m katgateway --admin-user <issuer_login> user disable alice
+python -m katgateway --admin-user <issuer_login> user set-password alice
+```
+
+`token create` prints the bearer token once; it cannot be recovered from the
+database. Expiry is 1-90 days and defaults to 90 days. See
+[deployment](deployment.md) for the migrations and database grants.
+
+### Sign-in
+
+Users with a password set by `user set-password` can get their own token
+without an administrator. The desktop transfer app uses these routes; they share
+the base URL of the other endpoints.
+
+| Method | Route | Sends | Returns |
+|---|---|---|---|
+| POST | `/v1/auth/login` | JSON `username`, `password`, optional `role` (`write` default, or `read`) and `expires_days` (1-90, default 90) | `token`, `token_id`, `username`, `role`, `expires_at` |
+| GET | `/v1/auth/me` | Bearer token | `token_id`, `username`, `role`, `expires_at`; 401 if the token no longer works |
+| POST | `/v1/auth/logout` | Bearer token | 204; that token is revoked immediately |
+
+```bash
+curl -X POST https://<host>/csit321/v1/auth/login -H "Content-Type: application/json" \
+     -d '{"username": "alice", "password": "<password>", "role": "write"}'
+```
+
+- Wrong password, unknown user, inactive user or a user with no password all
+  return the same 401 `Incorrect username or password`.
+- Asking for `write` when the user's `max_role` is `read` returns 403
+  `Your account can view but not send data`; no token is issued.
+- Five failed attempts for one username within five minutes return 429 with
+  `Retry-After`. NGINX limits attempts per client address (`deploy/nginx.live.conf`).
+- Sign-in requires HTTPS: a request forwarded with `X-Forwarded-Proto` other than
+  `https` gets 403. Direct loopback requests (an SSH tunnel) are allowed.
+- The token is returned once with `Cache-Control: no-store`. Passwords and tokens
+  are never logged; only the SHA-256 token hash and a salted scrypt password hash
+  are stored.
+- The gateway issues and revokes sign-in tokens through a separate issuer
+  database login (`KAT_ISSUER_PG_USER` / `KAT_ISSUER_PG_PASSWORD`). Without one,
+  login and logout return 503 and admin-issued tokens keep working. The ingest
+  database role still cannot create tokens or read password hashes.
+
+`/health`, `/docs` and `/openapi.json` expose process health or documentation
+without archive data.
 
 ## Ingestion
 
@@ -62,10 +118,10 @@ For `/v1/ingest/environment`, each row contains `systemid`, non-null `ts` and
 `data`; the batch also contains `xfer`, origin, host, started_at and trigger.
 Allowed triggers are `manual`, `startup`, `sweep` and `zmq`.
 
-`data` is JSON **text inside a JSON string**, preserving the source's formatting.
-Do not replace it with a nested object. Invalid JSON, including non-finite
-numbers, is rejected. Nullable data means SQL null; the string `"null"` means
-the JSON value null. PostgreSQL's `json` type preserves the source text.
+`data` is JSON **text inside a JSON string**, preserving the source formatting.
+Invalid JSON, including non-finite numbers, is rejected. Do not replace it with
+a nested object. Nullable data means SQL null; the string `"null"` means JSON
+null. PostgreSQL's `json` type preserves the source text.
 
 HTTP 200 returns:
 
@@ -75,27 +131,24 @@ HTTP 200 returns:
 
 The API sends this only after commit. `sent` counts source rows and `applied`
 counts unique keys upserted. Repeated environment keys keep the last value, so
-`applied` can be smaller than `sent`. First-ingestion timestamps are preserved
-on retries. Only a complete receipt permits the client to stamp SQLite.
+`applied` can be smaller than `sent`. Only a complete receipt permits the client
+to stamp SQLite.
 
-Measurement/environment data and the successful audit record commit together.
-Parent upserts are separate, without child audit records, matching the existing
-transfer-log convention. A rejection rolls back that entire table batch.
-HTTP 409 means an archive constraint failed, such as a missing parent; 422
-means validation failed; 413 means the request is too large; 503 means a database
-request could not complete. Any unconfirmed batch remains eligible for replay.
-SQL and submitted payloads are excluded from error responses. Failed attempts
-are reported by the client and server logs, not recorded as successful transfers.
+Each ingestion batch and its `transfer_log` row (including `api_token_id`) commit
+in one transaction. Transfer reads include the associated username as
+`uploaded_by`. A rejection rolls back that entire batch. HTTP 409 means an
+archive constraint failed, such as a missing parent; 422 means validation
+failed; 413 means the request is too large; 503 means a database request could
+not complete. SQL, submitted payloads and bearer tokens are excluded from error
+responses. Failed attempts are not recorded as successful transfers.
 
 ## Reading and Pandas
 
 `GET /v1/experimental-data?systemid=CSIT321FAKE&run=9001&limit=100&offset=0`
-returns `items`, `limit` and `offset`. List results use a stable primary-key order.
-Use `limit` up to 1000 and keep requesting pages until one contains fewer rows.
-Environment reads accept inclusive `from_ts` and `to_ts` timestamp filters.
-The optional `origin=real` or `origin=fake` filter applies to all data lists.
-
-This Python example retrieves one run into Pandas without a database login:
+returns `items`, `limit` and `offset`. List results use a stable primary-key
+order. Use `limit` up to 1000 and keep requesting pages until one contains fewer
+rows. Environment reads accept inclusive `from_ts` and `to_ts` timestamp filters.
+The optional `origin=real` or `origin=fake` filter applies to data lists.
 
 ```python
 import json
@@ -106,7 +159,7 @@ import pandas as pd
 rows = []
 offset = 0
 with httpx.Client(
-    base_url="https://192.168.40.100/csit321/",
+    base_url="https://example.edu/csit321/",
     headers={"Authorization": "Bearer " + os.environ["KAT_API_READ_TOKEN"]},
     timeout=30,
 ) as client:
@@ -130,16 +183,7 @@ print(frame)
 Install `httpx` and `pandas` in the researcher's environment. Confirm the live URL
 with the administrator. With a private certificate authority, provide its trust
 certificate to the HTTP client. Do not disable certificate verification.
-`tools/read_run.py` provides pagination and CSV output without needing Pandas.
-The verification tools use paged API reads and compare raw JSON text.
-
+`tools/read_run.py` provides pagination and CSV output without a database login.
 Offset pagination is not a database snapshot. Pause writes when collecting a
-fixed integrity comparison. The prototype has role-based access via two shared
-tokens; it does not restrict each token to a particular rig or user.
-
-## Implementation references
-
-- [FastAPI security tools](https://fastapi.tiangolo.com/reference/security/)
-- [FastAPI error handling](https://fastapi.tiangolo.com/tutorial/handling-errors/)
-- [Psycopg transaction control](https://www.psycopg.org/docs/usage.html#transactions-control)
-- [NGINX proxy routing](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass)
+fixed integrity comparison. Access is per user and token, but is not restricted
+to a particular rig.
